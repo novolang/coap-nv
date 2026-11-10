@@ -116,7 +116,7 @@ fn method_bit(code: Int) -> Int []
 //         1
 //     fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader,
 //                   var resp: CoapMsg, var b: CoapBuilder) -> Int
-//         CONTENT
+//         coapwire.COAP_CONTENT
 //
 // fn main() [io]
 //     var m: coapwire.CoapMsg = Vec.new()
