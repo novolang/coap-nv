@@ -54,3 +54,10 @@ The first release.
   freshness rule.
 - Block sizes above 1024 bytes and Q-Block (RFC 9177).
 - A response cache. The caller keeps the response it sent the first time.
+
+### Known
+
+- `CoapNoResources` is in the package so that `serve` and `find_resource` can
+  carry `@no_alloc`: a function generic over a trait bound builds only when the
+  compilation unit holds an impl of the trait. The filing is
+  `no-alloc-through-a-trait-bound-is-refused-when-the-package-has-no-impl`.

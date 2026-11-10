@@ -269,6 +269,7 @@ struct CoapNoResources
     // Unused; a `@value` needs a field.
     unused: Int
 
+// workaround(no-alloc-through-a-trait-bound-is-refused-when-the-package-has-no-impl): a @no_alloc function generic over a trait bound builds only when the compilation unit holds an impl of the trait, so the package holds this one.
 impl CoapResources[] for CoapNoResources
     @tier(embedded)
     fn res_count(self) -> Int []
