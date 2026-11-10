@@ -1,0 +1,24 @@
+[package]
+name        = "coap-nv"
+version     = "0.1.0"
+description = "CoAP over UDP for novo-lang, RFC 7252 with block-wise transfer (RFC 7959) and observe (RFC 7641): the message, its options and token, the message layer with confirmable retransmission as a step a caller drives, block and observer state, and a server that routes a request to the caller's resource handler. Over buffers the caller owns, with no allocation and no sockets."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "core"
+tags        = ["coap", "rfc7252", "rfc7959", "rfc7641", "iot", "udp", "observe", "block-wise", "embedded", "sans-io", "no-alloc"]
+repository  = "https://github.com/novolang/coap-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A CoAP endpoint for a sensor with no heap, as steps the caller drives"
+
+[dependencies]
+# None.  A message is bytes in a buffer the caller owns, and the state of an
+# exchange is integers.  The payload formats CoAP carries (CBOR, JSON,
+# SenML) are another package's: this one carries the payload as bytes it
+# does not read.

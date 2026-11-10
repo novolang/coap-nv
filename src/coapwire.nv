@@ -1,0 +1,886 @@
+// coapwire.nv — the CoAP message of RFC 7252, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A message is built
+// into a buffer the caller owns and read in place, so a sensor, a task or
+// a test can build and read one with no heap.
+//
+// THE FORMAT, from section 3 of RFC 7252.
+//
+//    0                   1                   2                   3
+//    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//   |Ver| T |  TKL  |      Code     |          Message ID           |
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//   |   Token (if any, TKL bytes) ...
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//   |   Options (if any) ...
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//   |1 1 1 1 1 1 1 1|    Payload (if any) ...
+//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
+// Version is 1.  Type is 0 confirmable, 1 non-confirmable, 2
+// acknowledgement, 3 reset.  The code is a class in its three high bits
+// and a detail in its five low bits, written "c.dd": 0.01 is GET, 2.05 is
+// Content, 4.04 is Not Found.
+//
+// AN OPTION is a delta from the number of the option before it, a length,
+// and a value.  The first byte holds the delta in its high four bits and
+// the length in its low four.  A nibble of 13 means one more byte follows
+// and the number is that byte plus 13; 14 means two more bytes and the
+// number is that value plus 269; 15 is reserved, and the byte 0xFF that
+// would otherwise be a delta of 15 and a length of 15 is the payload
+// marker.  So options are written in order of their numbers, and an
+// option that repeats has a delta of 0.
+//
+// THE TOKEN is up to eight bytes of opaque data that a client chooses and
+// a server echoes.  Here it is a `CoapToken`, a length and the bytes in
+// one `Int`, first byte highest, so that two tokens compare with two
+// integer comparisons and no buffer is held.
+//
+// WHAT A MESSAGE MAY BE.  A message is at most `COAP_MSG_MAX` bytes, 1152.
+// RFC 7252 recommends 1152 bytes of payload and a datagram that fits an
+// IPv6 minimum MTU of 1280; a block of 1024 and its options are well
+// inside it.  A message with a payload marker and no payload is a format
+// error (section 3), and so is an Empty message (code 0.00) with anything
+// after its four bytes.
+//
+// CoAP over TCP, TLS and WebSockets (RFC 8323) uses a different framing
+// and is not here.
+
+// The version in every message: 1.
+pub const COAP_VERSION = 1
+
+// Type: confirmable, 0.
+pub const COAP_TYPE_CON = 0
+// Type: non-confirmable, 1.
+pub const COAP_TYPE_NON = 1
+// Type: acknowledgement, 2.
+pub const COAP_TYPE_ACK = 2
+// Type: reset, 3.
+pub const COAP_TYPE_RST = 3
+
+// The largest message this package builds or reads, in bytes: 1152.
+pub const COAP_MSG_MAX = 1152
+// The longest token, in bytes: 8.
+pub const COAP_TOKEN_MAX = 8
+// The byte that separates the options from the payload: 0xFF.
+pub const COAP_PAYLOAD_MARKER = 0xFF
+
+// Code 0.00, Empty: a ping, a reset or an empty acknowledgement.
+pub const COAP_CODE_EMPTY = 0x00
+// Code 0.01, the GET method.
+pub const COAP_GET = 0x01
+// Code 0.02, the POST method.
+pub const COAP_POST = 0x02
+// Code 0.03, the PUT method.
+pub const COAP_PUT = 0x03
+// Code 0.04, the DELETE method.
+pub const COAP_DELETE = 0x04
+
+// Code 2.01 Created.
+pub const COAP_CREATED = 0x41
+// Code 2.02 Deleted.
+pub const COAP_DELETED = 0x42
+// Code 2.03 Valid.
+pub const COAP_VALID = 0x43
+// Code 2.04 Changed.
+pub const COAP_CHANGED = 0x44
+// Code 2.05 Content.
+pub const COAP_CONTENT = 0x45
+// Code 2.31 Continue, the answer to a block of a request body (RFC 7959).
+pub const COAP_CONTINUE = 0x5F
+// Code 4.00 Bad Request.
+pub const COAP_BAD_REQUEST = 0x80
+// Code 4.01 Unauthorized.
+pub const COAP_UNAUTHORIZED = 0x81
+// Code 4.02 Bad Option.
+pub const COAP_BAD_OPTION = 0x82
+// Code 4.03 Forbidden.
+pub const COAP_FORBIDDEN = 0x83
+// Code 4.04 Not Found.
+pub const COAP_NOT_FOUND = 0x84
+// Code 4.05 Method Not Allowed.
+pub const COAP_METHOD_NOT_ALLOWED = 0x85
+// Code 4.06 Not Acceptable.
+pub const COAP_NOT_ACCEPTABLE = 0x86
+// Code 4.08 Request Entity Incomplete (RFC 7959).
+pub const COAP_REQUEST_ENTITY_INCOMPLETE = 0x88
+// Code 4.12 Precondition Failed.
+pub const COAP_PRECONDITION_FAILED = 0x8C
+// Code 4.13 Request Entity Too Large.
+pub const COAP_REQUEST_ENTITY_TOO_LARGE = 0x8D
+// Code 4.15 Unsupported Content-Format.
+pub const COAP_UNSUPPORTED_CONTENT_FORMAT = 0x8F
+// Code 5.00 Internal Server Error.
+pub const COAP_INTERNAL_SERVER_ERROR = 0xA0
+// Code 5.01 Not Implemented.
+pub const COAP_NOT_IMPLEMENTED = 0xA1
+// Code 5.02 Bad Gateway.
+pub const COAP_BAD_GATEWAY = 0xA2
+// Code 5.03 Service Unavailable.
+pub const COAP_SERVICE_UNAVAILABLE = 0xA3
+// Code 5.04 Gateway Timeout.
+pub const COAP_GATEWAY_TIMEOUT = 0xA4
+// Code 5.05 Proxying Not Supported.
+pub const COAP_PROXYING_NOT_SUPPORTED = 0xA5
+
+// Option number: If-Match, 1.
+pub const COAP_OPT_IF_MATCH = 1
+// Option number: Uri-Host, 3.
+pub const COAP_OPT_URI_HOST = 3
+// Option number: ETag, 4.
+pub const COAP_OPT_ETAG = 4
+// Option number: If-None-Match, 5.
+pub const COAP_OPT_IF_NONE_MATCH = 5
+// Option number: Observe, 6 (RFC 7641).
+pub const COAP_OPT_OBSERVE = 6
+// Option number: Uri-Port, 7.
+pub const COAP_OPT_URI_PORT = 7
+// Option number: Location-Path, 8.
+pub const COAP_OPT_LOCATION_PATH = 8
+// Option number: Uri-Path, 11.
+pub const COAP_OPT_URI_PATH = 11
+// Option number: Content-Format, 12.
+pub const COAP_OPT_CONTENT_FORMAT = 12
+// Option number: Max-Age, 14.
+pub const COAP_OPT_MAX_AGE = 14
+// Option number: Uri-Query, 15.
+pub const COAP_OPT_URI_QUERY = 15
+// Option number: Accept, 17.
+pub const COAP_OPT_ACCEPT = 17
+// Option number: Location-Query, 20.
+pub const COAP_OPT_LOCATION_QUERY = 20
+// Option number: Block2, 23 (RFC 7959).
+pub const COAP_OPT_BLOCK2 = 23
+// Option number: Block1, 27 (RFC 7959).
+pub const COAP_OPT_BLOCK1 = 27
+// Option number: Size2, 28 (RFC 7959).
+pub const COAP_OPT_SIZE2 = 28
+// Option number: Proxy-Uri, 35.
+pub const COAP_OPT_PROXY_URI = 35
+// Option number: Proxy-Scheme, 39.
+pub const COAP_OPT_PROXY_SCHEME = 39
+// Option number: Size1, 60.
+pub const COAP_OPT_SIZE1 = 60
+
+// A message parsed without fault.
+pub const COAP_PARSE_OK = 0
+// The message is shorter than its header, its token or an option says.
+pub const COAP_PARSE_TOO_SHORT = 1
+// The version is not 1.
+pub const COAP_PARSE_BAD_VERSION = 2
+// The token length is 9 or more.
+pub const COAP_PARSE_BAD_TOKEN_LENGTH = 3
+// An option has a reserved delta or length, or runs past the message.
+pub const COAP_PARSE_BAD_OPTION = 4
+// The payload marker is the last byte of the message.
+pub const COAP_PARSE_EMPTY_PAYLOAD = 5
+// An Empty message (code 0.00) is longer than four bytes, or has a token.
+pub const COAP_PARSE_BAD_EMPTY = 6
+
+// A buffer for one message: the type every function here takes.
+pub alias CoapMsg = Vec[u8; COAP_MSG_MAX]
+
+// A token: how many bytes, and the bytes in one number, first byte highest.
+pub @value
+struct CoapToken
+    // The number of bytes, 0 to 8.
+    len: Int
+    // The bytes, with the first in the highest of the `len` bytes of the
+    // number.
+    value: Int
+
+// What the front of a message says.
+//
+// `status` is `COAP_PARSE_OK` or the fault; no other field means anything
+// after a fault.  `options_off` is the index of the first option,
+// `payload_off` the index of the first byte of the payload, which is
+// `len` when there is none.
+pub @value
+struct CoapHeader
+    // `COAP_PARSE_OK` or one of the faults.
+    status: Int
+    // `COAP_TYPE_CON`, `COAP_TYPE_NON`, `COAP_TYPE_ACK` or `COAP_TYPE_RST`.
+    kind: Int
+    // The code byte: class in the high three bits, detail in the low five.
+    code: Int
+    // The message ID, 0 to 65535.
+    mid: Int
+    // The token.
+    token: CoapToken
+    // The index of the first option, or of the end of the header.
+    options_off: Int
+    // The index of the first payload byte, or `len` for no payload.
+    payload_off: Int
+    // The length of the message in bytes.
+    len: Int
+
+// A place in the options of a message: where the walk is, and the option
+// it last found.
+pub @value
+struct CoapOptIter
+    // The index of the next option's first byte.
+    pos: Int
+    // The index at which the options end.
+    end: Int
+    // The number of the option last found, or 0 before the first.
+    number: Int
+    // The index of the first byte of its value.
+    value_off: Int
+    // The length of its value in bytes.
+    value_len: Int
+
+// The state of a message being built: the number of the last option
+// written, and whether every step so far has fitted.
+pub @value
+struct CoapBuilder
+    // The number of the last option written; the next must not be lower.
+    last: Int
+    // False after a step failed; the message was emptied.
+    ok: Bool
+
+// A token of `len` bytes holding `value`.
+//
+// `len` is held to 0 through 8, and `value` is cut to the bytes it has.
+//
+// ```novo
+// use coapwire
+//
+// fn main() [io]
+//     let t = coapwire.token(0xBEEF, 2)
+//     println("${t.len} ${coapwire.token_byte(t, 0)} ${coapwire.token_byte(t, 1)}")   // 2 190 239
+// ```
+pub @tier(embedded)
+@no_alloc
+fn token(value: Int, len: Int) -> CoapToken []
+    var n = len
+    if n < 0
+        n = 0
+    if n > COAP_TOKEN_MAX
+        n = COAP_TOKEN_MAX
+    if n == 0
+        return CoapToken { len: 0, value: 0 }
+    if n == COAP_TOKEN_MAX
+        return CoapToken { len: n, value: value }
+    CoapToken { len: n, value: value & ((1 << (8 * n)) - 1) }
+
+// Byte `i` of a token, counting from the first, or 0 outside it.
+pub @tier(embedded)
+@no_alloc
+fn token_byte(t: CoapToken, i: Int) -> Int []
+    if i < 0 or i >= t.len
+        return 0
+    (t.value >>> (8 * (t.len - 1 - i))) & 0xFF
+
+// Whether two tokens are the same bytes.
+pub @tier(embedded)
+@no_alloc
+fn token_eq(a: CoapToken, b: CoapToken) -> Bool []
+    a.len == b.len and a.value == b.value
+
+// The class of a code: 0 for a request or Empty, 2 success, 4 client
+// error, 5 server error.
+pub @tier(embedded)
+@no_alloc
+fn code_class(code: Int) -> Int []
+    (code >> 5) & 7
+
+// The detail of a code, the two digits after the dot.
+pub @tier(embedded)
+@no_alloc
+fn code_detail(code: Int) -> Int []
+    code & 31
+
+// Whether a code is a request: class 0 with a detail other than 0.
+pub @tier(embedded)
+@no_alloc
+fn is_request(code: Int) -> Bool []
+    code_class(code) == 0 and code_detail(code) != 0
+
+// Whether a code is a response: class 2, 4 or 5.
+pub @tier(embedded)
+@no_alloc
+fn is_response(code: Int) -> Bool []
+    let c = code_class(code)
+    c == 2 or c == 4 or c == 5
+
+// The code of class `class` and detail `detail`, as `c.dd` writes it.
+//
+// ```novo
+// use coapwire
+//
+// fn main() [io]
+//     println("${coapwire.make_code(2, 5) == coapwire.COAP_CONTENT}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn make_code(class: Int, detail: Int) -> Int []
+    ((class & 7) << 5) | (detail & 31)
+
+// Whether an option number is critical: the odd ones (section 5.4.6).
+pub @tier(embedded)
+@no_alloc
+fn option_is_critical(number: Int) -> Bool []
+    (number & 1) == 1
+
+// The decoded value of the extended delta or length at `pos`, given its
+// nibble: the nibble itself under 13, one byte plus 13 for 13, two bytes
+// plus 269 for 14.  The size consumed is `ext_size`.  -1 for the reserved
+// nibble 15 and for an extension that runs past `limit`.
+@tier(embedded)
+@no_alloc
+fn ext_value(var m: CoapMsg, nibble: Int, pos: Int, limit: Int) -> Int []
+    if nibble < 13
+        return nibble
+    if nibble == 13
+        if pos + 1 > limit
+            return -1
+        return m[pos] as Int + 13
+    if nibble == 14
+        if pos + 2 > limit
+            return -1
+        return (m[pos] as Int << 8) + m[pos + 1] as Int + 269
+    -1
+
+// How many bytes the extension of a nibble takes: 0, 1 or 2.
+@tier(embedded)
+@no_alloc
+fn ext_size(nibble: Int) -> Int []
+    if nibble == 13
+        return 1
+    if nibble == 14
+        return 2
+    0
+
+// Walk the options from `from`, counting each, and answer the index of
+// the payload marker, `len` when there is no payload, or -1 for a fault.
+@tier(embedded)
+@no_alloc
+fn options_end(var m: CoapMsg, from: Int) -> Int []
+    var pos = from
+    for _i in 0..m.len()
+        if pos < m.len() and m[pos] != 0xFF
+            let b = m[pos] as Int
+            let dn = b >> 4
+            let ln = b & 15
+            let delta = ext_value(var m, dn, pos + 1, m.len())
+            if delta < 0
+                return -1
+            let at = pos + 1 + ext_size(dn)
+            let length = ext_value(var m, ln, at, m.len())
+            if length < 0
+                return -1
+            let next = at + ext_size(ln) + length
+            if next > m.len()
+                return -1
+            pos = next
+    pos
+
+// The header that stands for a fault.
+@tier(embedded)
+@no_alloc
+fn fault(status: Int) -> CoapHeader []
+    CoapHeader { status: status, kind: 0, code: 0, mid: 0, token: CoapToken { len: 0, value: 0 },
+                 options_off: 0, payload_off: 0, len: 0 }
+
+// Read the front of a message.
+//
+// The options are checked from end to end, so a message that parses has
+// well-formed options and a payload that starts where `payload_off` says.
+// The checks are those of section 3: version 1, a token of 8 bytes or
+// fewer, options that stay inside the message, a payload marker that has a
+// payload after it, and an Empty message of exactly four bytes.
+//
+// ```novo
+// use coapwire
+//
+// fn main() [io]
+//     // A confirmable GET, message ID 0x1234, token 0x71, no options.
+//     var m: coapwire.CoapMsg = Vec.new()
+//     for b in [0x41, 0x01, 0x12, 0x34, 0x71]
+//         let _ = m.push(b as u8)
+//     let h = coapwire.parse(var m)
+//     println("${h.status} ${h.kind} ${h.code} ${h.mid} ${h.token.len}")   // 0 0 1 4660 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn parse(var m: CoapMsg) -> CoapHeader []
+    if m.len() < 4
+        return fault(COAP_PARSE_TOO_SHORT)
+    let b0 = m[0] as Int
+    if (b0 >> 6) != COAP_VERSION
+        return fault(COAP_PARSE_BAD_VERSION)
+    let tkl = b0 & 15
+    if tkl > COAP_TOKEN_MAX
+        return fault(COAP_PARSE_BAD_TOKEN_LENGTH)
+    if m.len() < 4 + tkl
+        return fault(COAP_PARSE_TOO_SHORT)
+    let code = m[1] as Int
+    if code == COAP_CODE_EMPTY and m.len() != 4
+        return fault(COAP_PARSE_BAD_EMPTY)
+    var value = 0
+    for i in 0..tkl
+        value = (value << 8) | m[4 + i] as Int
+    let start = 4 + tkl
+    let end = options_end(var m, start)
+    if end < 0
+        return fault(COAP_PARSE_BAD_OPTION)
+    var payload = m.len()
+    if end < m.len()
+        if end + 1 >= m.len()
+            return fault(COAP_PARSE_EMPTY_PAYLOAD)
+        payload = end + 1
+    CoapHeader { status: COAP_PARSE_OK, kind: (b0 >> 4) & 3, code: code,
+                 mid: (m[2] as Int << 8) | m[3] as Int,
+                 token: CoapToken { len: tkl, value: value }, options_off: start,
+                 payload_off: payload, len: m.len() }
+
+// Whether a header was read without fault.
+pub @tier(embedded)
+@no_alloc
+fn header_ok(h: CoapHeader) -> Bool []
+    h.status == COAP_PARSE_OK
+
+// The number of payload bytes a parsed message carries.
+pub @tier(embedded)
+@no_alloc
+fn payload_len(h: CoapHeader) -> Int []
+    h.len - h.payload_off
+
+// Byte `i` of the payload, or -1 outside it.
+pub @tier(embedded)
+@no_alloc
+fn payload_byte(var m: CoapMsg, h: CoapHeader, i: Int) -> Int []
+    if i < 0 or h.payload_off + i >= h.len
+        return -1
+    m[h.payload_off + i] as Int
+
+// An iterator at the first option of a parsed message.
+//
+// ```novo
+// use coapwire
+//
+// fn main() [io]
+//     var m: coapwire.CoapMsg = Vec.new()
+//     var b = coapwire.builder()
+//     let t = coapwire.token(0, 0)
+//     let _ = coapwire.begin(var m, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 1, t)
+//     let _ = coapwire.add_path(var m, var b, "/a/bc")
+//     let h = coapwire.parse(var m)
+//     var it = coapwire.opt_iter(h)
+//     var n = 0
+//     while coapwire.opt_next(var m, var it)
+//         n = n + it.value_len
+//     println("${n}")   // 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opt_iter(h: CoapHeader) -> CoapOptIter []
+    var end = h.payload_off
+    if h.payload_off < h.len
+        end = h.payload_off - 1
+    CoapOptIter { pos: h.options_off, end: end, number: 0, value_off: 0, value_len: 0 }
+
+// Move to the next option and answer whether there was one.
+//
+// After a true answer `number`, `value_off` and `value_len` describe the
+// option.  The iterator was made from a message that parsed, so every
+// option it meets is well formed.
+pub @tier(embedded)
+@no_alloc
+fn opt_next(var m: CoapMsg, var it: CoapOptIter) -> Bool []
+    if it.pos >= it.end
+        return false
+    let b = m[it.pos] as Int
+    let dn = b >> 4
+    let ln = b & 15
+    let delta = ext_value(var m, dn, it.pos + 1, it.end)
+    let at = it.pos + 1 + ext_size(dn)
+    let length = ext_value(var m, ln, at, it.end)
+    it.number = it.number + delta
+    it.value_off = at + ext_size(ln)
+    it.value_len = length
+    it.pos = it.value_off + length
+    true
+
+// The unsigned integer an option holds, up to eight bytes big-endian, or
+// -1 when the option is longer than eight bytes.
+//
+// A length of zero is the value 0.
+pub @tier(embedded)
+@no_alloc
+fn opt_uint(var m: CoapMsg, it: CoapOptIter) -> Int []
+    if it.value_len > 8
+        return -1
+    var v = 0
+    for i in 0..it.value_len
+        v = (v << 8) | m[it.value_off + i] as Int
+    v
+
+// The value of the first option numbered `number` read as an integer,
+// or -1 when the message has none or its value is longer than eight bytes.
+//
+// ```novo
+// use coapwire
+//
+// fn main() [io]
+//     var m: coapwire.CoapMsg = Vec.new()
+//     var b = coapwire.builder()
+//     let _ = coapwire.begin(var m, var b, coapwire.COAP_TYPE_NON, coapwire.COAP_GET, 1, coapwire.token(0, 0))
+//     let _ = coapwire.add_uint(var m, var b, coapwire.COAP_OPT_CONTENT_FORMAT, 60)
+//     let h = coapwire.parse(var m)
+//     println("${coapwire.find_uint(var m, h, 12)} ${coapwire.find_uint(var m, h, 14)}")   // 60 -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn find_uint(var m: CoapMsg, h: CoapHeader, number: Int) -> Int []
+    var it = opt_iter(h)
+    for _i in 0..h.len
+        if opt_next(var m, var it)
+            if it.number == number
+                return opt_uint(var m, it)
+    -1
+
+// Whether the message has an option numbered `number`.
+pub @tier(embedded)
+@no_alloc
+fn has_option(var m: CoapMsg, h: CoapHeader, number: Int) -> Bool []
+    var it = opt_iter(h)
+    for _i in 0..h.len
+        if opt_next(var m, var it)
+            if it.number == number
+                return true
+    false
+
+// How many options numbered `number` the message has.
+pub @tier(embedded)
+@no_alloc
+fn count_options(var m: CoapMsg, h: CoapHeader, number: Int) -> Int []
+    var it = opt_iter(h)
+    var n = 0
+    for _i in 0..h.len
+        if opt_next(var m, var it)
+            if it.number == number
+                n = n + 1
+    n
+
+// The number of the first critical option the message carries that is not
+// one of those a CoAP server of this package understands, or -1.
+//
+// Section 5.4.1 asks a server to answer a confirmable request that has
+// such an option with 4.02, and to drop a non-confirmable one.  The options
+// understood are If-Match, Uri-Host, If-None-Match, Uri-Port, Uri-Path,
+// Uri-Query, Accept, Block2, Block1; the rest of the critical ones
+// (Proxy-Uri, Proxy-Scheme, and any not defined) are not.
+pub @tier(embedded)
+@no_alloc
+fn unknown_critical(var m: CoapMsg, h: CoapHeader) -> Int []
+    var it = opt_iter(h)
+    for _i in 0..h.len
+        if opt_next(var m, var it)
+            if option_is_critical(it.number) and not option_is_understood(it.number)
+                return it.number
+    -1
+
+// Whether a critical option number is one this package handles.
+@tier(embedded)
+@no_alloc
+fn option_is_understood(number: Int) -> Bool []
+    number == COAP_OPT_IF_MATCH or number == COAP_OPT_URI_HOST
+        or number == COAP_OPT_IF_NONE_MATCH or number == COAP_OPT_URI_PORT
+        or number == COAP_OPT_URI_PATH or number == COAP_OPT_URI_QUERY
+        or number == COAP_OPT_ACCEPT or number == COAP_OPT_BLOCK2 or number == COAP_OPT_BLOCK1
+
+// A fresh builder.
+pub @tier(embedded)
+@no_alloc
+fn builder() -> CoapBuilder []
+    CoapBuilder { last: 0, ok: true }
+
+// Empty the message and mark the builder failed.  Answers false.
+@tier(embedded)
+@no_alloc
+fn failed(var m: CoapMsg, var b: CoapBuilder) -> Bool []
+    m.clear()
+    b.ok = false
+    false
+
+// Append one byte.
+@tier(embedded)
+@no_alloc
+fn put_byte(var m: CoapMsg, v: Int) -> Bool []
+    match m.push((v & 0xFF) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Start a message: the header and the token, replacing what `m` held.
+//
+// `kind` is one of the four types, `code` the code byte, `mid` the message
+// ID, and `tok` the token.  The builder is reset, so options follow in the
+// order of their numbers.  Answers false, with `m` empty, when the type is
+// out of range or the token is longer than 8 bytes.
+//
+// ```novo
+// use coapwire
+//
+// fn main() [io]
+//     var m: coapwire.CoapMsg = Vec.new()
+//     var b = coapwire.builder()
+//     let ok = coapwire.begin(var m, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0x1234, coapwire.token(0x71, 1))
+//     println("${ok} ${m.len()} ${m[0]} ${m[2]} ${m[3]} ${m[4]}")   // true 5 65 18 52 113
+// ```
+pub @tier(embedded)
+@no_alloc
+fn begin(var m: CoapMsg, var b: CoapBuilder, kind: Int, code: Int, mid: Int,
+         tok: CoapToken) -> Bool []
+    m.clear()
+    b.last = 0
+    b.ok = true
+    if kind < 0 or kind > 3 or tok.len < 0 or tok.len > COAP_TOKEN_MAX
+        return failed(var m, var b)
+    var ok = put_byte(var m, (COAP_VERSION << 6) | (kind << 4) | tok.len)
+    ok = ok and put_byte(var m, code) and put_byte(var m, mid >> 8) and put_byte(var m, mid)
+    for i in 0..tok.len
+        ok = ok and put_byte(var m, token_byte(tok, i))
+    // The header and the token are at most twelve bytes and the buffer was
+    // just emptied, so every byte fitted.
+    ok
+
+// Write the first byte or bytes of an option: its delta from the last and
+// its length.  Answers false when the number is lower than the last or
+// the pieces do not fit.
+@tier(embedded)
+@no_alloc
+fn put_head(var m: CoapMsg, var b: CoapBuilder, number: Int, length: Int) -> Bool []
+    if not b.ok or number < b.last or number > 65535 or length > 65535 + 269
+        return false
+    let delta = number - b.last
+    var dn = delta
+    var ln = length
+    if delta >= 269
+        dn = 14
+    else if delta >= 13
+        dn = 13
+    if length >= 269
+        ln = 14
+    else if length >= 13
+        ln = 13
+    var ok = put_byte(var m, (dn << 4) | ln)
+    if delta >= 269
+        ok = ok and put_byte(var m, (delta - 269) >> 8) and put_byte(var m, delta - 269)
+    else if delta >= 13
+        ok = ok and put_byte(var m, delta - 13)
+    if length >= 269
+        ok = ok and put_byte(var m, (length - 269) >> 8) and put_byte(var m, length - 269)
+    else if length >= 13
+        ok = ok and put_byte(var m, length - 13)
+    b.last = number
+    ok
+
+// Append an option whose value is an unsigned integer.
+//
+// The value is written in the fewest bytes, so 0 is an option of no bytes
+// and 256 is two.  `v` must not be negative.  Answers false, with the
+// message emptied and the builder failed, when the option is out of order,
+// `v` is negative or the message is full.
+pub @tier(embedded)
+@no_alloc
+fn add_uint(var m: CoapMsg, var b: CoapBuilder, number: Int, v: Int) -> Bool []
+    if v < 0
+        return failed(var m, var b)
+    var n = 0
+    for k in 0..8
+        if (v >>> (8 * k)) != 0
+            n = k + 1
+    var ok = put_head(var m, var b, number, n)
+    for i in 0..n
+        ok = ok and put_byte(var m, v >>> (8 * (n - 1 - i)))
+    if not ok
+        return failed(var m, var b)
+    true
+
+// Append an option whose value is the bytes of a string.
+pub @tier(embedded)
+@no_alloc
+fn add_str(var m: CoapMsg, var b: CoapBuilder, number: Int, s: Str) -> Bool []
+    var ok = put_head(var m, var b, number, str.len(s))
+    for i in 0..str.len(s)
+        ok = ok and put_byte(var m, str.byte_at_or(s, i, 0))
+    if not ok
+        return failed(var m, var b)
+    true
+
+// Append an option whose value is `len` bytes held in an integer, first
+// byte highest: an ETag, or an If-Match value.  `len` is 0 through 8.
+pub @tier(embedded)
+@no_alloc
+fn add_opaque(var m: CoapMsg, var b: CoapBuilder, number: Int, value: Int, len: Int) -> Bool []
+    if len < 0 or len > COAP_TOKEN_MAX
+        return failed(var m, var b)
+    let t = token(value, len)
+    var ok = put_head(var m, var b, number, len)
+    for i in 0..len
+        ok = ok and put_byte(var m, token_byte(t, i))
+    if not ok
+        return failed(var m, var b)
+    true
+
+// Append an option with no value, such as If-None-Match.
+pub @tier(embedded)
+@no_alloc
+fn add_empty(var m: CoapMsg, var b: CoapBuilder, number: Int) -> Bool []
+    if not put_head(var m, var b, number, 0)
+        return failed(var m, var b)
+    true
+
+// Append one option per segment of a path, numbered `number`.
+@tier(embedded)
+@no_alloc
+fn add_segments(var m: CoapMsg, var b: CoapBuilder, number: Int, s: Str, from: Int,
+                sep: Int) -> Bool []
+    var start = from
+    var ok = true
+    let n = str.len(s)
+    if n <= from
+        return true
+    for i in from..n + 1
+        if i == n or str.byte_at_or(s, i, 0) == sep
+            ok = ok and put_head(var m, var b, number, i - start)
+            for k in start..i
+                ok = ok and put_byte(var m, str.byte_at_or(s, k, 0))
+            start = i + 1
+    if not ok
+        return failed(var m, var b)
+    true
+
+// Append the Uri-Path options for a path such as `/sensors/temp`.
+//
+// A leading slash is dropped, and each segment between slashes is one
+// option. "/" and "" are the root and add none. A trailing slash adds an
+// empty last segment, as `a/` and `a` are different paths.
+//
+// ```novo
+// use coapwire
+//
+// fn main() [io]
+//     var m: coapwire.CoapMsg = Vec.new()
+//     var b = coapwire.builder()
+//     let _ = coapwire.begin(var m, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 1, coapwire.token(0, 0))
+//     let _ = coapwire.add_path(var m, var b, "/sensors/temp")
+//     let h = coapwire.parse(var m)
+//     println("${coapwire.path_is(var m, h, "sensors/temp")}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn add_path(var m: CoapMsg, var b: CoapBuilder, path: Str) -> Bool []
+    var from = 0
+    if str.len(path) > 0 and str.byte_at_or(path, 0, 0) == 47
+        from = 1
+    add_segments(var m, var b, COAP_OPT_URI_PATH, path, from, 47)
+
+// Append the Uri-Query options for a query such as `a=1&b=2`: one per item
+// between ampersands.
+pub @tier(embedded)
+@no_alloc
+fn add_query(var m: CoapMsg, var b: CoapBuilder, query: Str) -> Bool []
+    add_segments(var m, var b, COAP_OPT_URI_QUERY, query, 0, 38)
+
+// End the options and start the payload: the marker.
+//
+// Options cannot be added after it. Answers false, with the message
+// emptied, when it does not fit.
+pub @tier(embedded)
+@no_alloc
+fn start_payload(var m: CoapMsg, var b: CoapBuilder) -> Bool []
+    b.last = 65536
+    if not b.ok or not put_byte(var m, COAP_PAYLOAD_MARKER)
+        return failed(var m, var b)
+    true
+
+// Append one byte of payload, after `start_payload`.  Answers false, with
+// the message emptied, when the message is full.
+pub @tier(embedded)
+@no_alloc
+fn push_payload(var m: CoapMsg, var b: CoapBuilder, v: Int) -> Bool []
+    if not b.ok or not put_byte(var m, v)
+        return failed(var m, var b)
+    true
+
+// Append the bytes of a string as payload, after `start_payload`.
+pub @tier(embedded)
+@no_alloc
+fn push_payload_str(var m: CoapMsg, var b: CoapBuilder, s: Str) -> Bool []
+    var ok = true
+    for i in 0..str.len(s)
+        ok = ok and push_payload(var m, var b, str.byte_at_or(s, i, 0))
+    ok
+
+// Whether the Uri-Path options of a parsed message spell `path`.
+//
+// `path` is written as `add_path` takes it, with or without the leading
+// slash, and each segment is compared as bytes. A request for the root has
+// no Uri-Path and matches "" and "/".
+pub @tier(embedded)
+@no_alloc
+fn path_is(var m: CoapMsg, h: CoapHeader, path: Str) -> Bool []
+    segments_are(var m, h, COAP_OPT_URI_PATH, path, leading_slash(path), 47)
+
+// Whether the first byte of a string is a slash: 1 when it is, else 0.
+@tier(embedded)
+@no_alloc
+fn leading_slash(s: Str) -> Int []
+    if str.len(s) > 0 and str.byte_at_or(s, 0, 0) == 47
+        return 1
+    0
+
+// Whether the query items of a parsed message include `item` exactly, such
+// as `"a=1"`.
+pub @tier(embedded)
+@no_alloc
+fn query_has(var m: CoapMsg, h: CoapHeader, item: Str) -> Bool []
+    var it = opt_iter(h)
+    for _i in 0..h.len
+        if opt_next(var m, var it)
+            if it.number == COAP_OPT_URI_QUERY and value_is(var m, it, item, 0, str.len(item))
+                return true
+    false
+
+// Whether the option's value is the bytes of `s` from `from` for `n`.
+@tier(embedded)
+@no_alloc
+fn value_is(var m: CoapMsg, it: CoapOptIter, s: Str, from: Int, n: Int) -> Bool []
+    if it.value_len != n
+        return false
+    for i in 0..n
+        if (m[it.value_off + i] as Int) != str.byte_at_or(s, from + i, 0)
+            return false
+    true
+
+// Whether the options numbered `number`, in order, are the pieces of `s`
+// from `from` between `sep` bytes.
+@tier(embedded)
+@no_alloc
+fn segments_are(var m: CoapMsg, h: CoapHeader, number: Int, s: Str, from: Int, sep: Int) -> Bool []
+    let n = str.len(s)
+    var it = opt_iter(h)
+    var start = from
+    var seen = 0
+    for _i in 0..h.len
+        if opt_next(var m, var it)
+            if it.number == number
+                // The piece of `s` this option has to equal.
+                var stop = start
+                for k in start..n
+                    if stop == k and str.byte_at_or(s, k, 0) != sep
+                        stop = k + 1
+                if start > n
+                    return false
+                if not value_is(var m, it, s, start, stop - start)
+                    return false
+                start = stop + 1
+                seen = seen + 1
+    // Every piece of `s` was used: nothing is left, or the empty
+    // remainder of a path with no segments.
+    if n <= from
+        return seen == 0
+    start == n + 1

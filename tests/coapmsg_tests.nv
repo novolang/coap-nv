@@ -1,0 +1,218 @@
+// coapmsg_tests.nv — the message layer, a step at a time.
+//
+// The expected waits are those of RFC 7252 section 4.2 worked out by hand:
+// ACK_TIMEOUT is 2 seconds, the first wait is that plus a share of
+// ACK_TIMEOUT * 0.5 chosen by the caller's draw, each repeat doubles it,
+// and MAX_RETRANSMIT is 4.  For a draw of 0 the waits are 2, 4, 8, 16 and
+// 32 seconds, which is 62 seconds in all.  The message bytes are derived
+// from the layout in section 3: 0x60 is version 1 and type ACK, 0x70 is
+// version 1 and type RST, 0x40 version 1 and CON, 0x50 NON, with 0x01
+// added for a token of one byte.
+
+use std.test
+use coapmsg
+use coapwire
+
+// A message from a list of byte values.
+fn msg_of(xs: [Int]) -> coapwire.CoapMsg
+    var m: coapwire.CoapMsg = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+// The index of the first byte of the message that differs from the
+// expected list, -2 when the lengths differ, and -1 when they agree.
+fn diff(var m: coapwire.CoapMsg, want: [Int]) -> Int
+    if m.len() != list.len(want)
+        return -2
+    for i in 0..m.len()
+        if (m[i] as Int) != want[i]
+            return i
+    -1
+
+// The header of a message of a given type and code with an ID and a token.
+fn header_of(kind: Int, code: Int, mid: Int, tok: coapwire.CoapToken) -> coapwire.CoapHeader
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    let _ = coapwire.begin(var m, var b, kind, code, mid, tok)
+    coapwire.parse(var m)
+
+@test
+fn test_the_schedule_for_a_draw_of_zero() [io]
+    let tok = coapwire.token(1, 1)
+    var t = coapmsg.tx_begin(7, tok, 0)
+    test.assert_eq(t.timeout_ms, 2000)
+    test.assert_eq(t.state, coapmsg.COAP_TX_WAITING)
+    test.assert_eq(coapmsg.tx_tick(var t, 1999), coapmsg.COAP_TICK_NONE)
+    test.assert_eq(coapmsg.tx_tick(var t, 1), coapmsg.COAP_TICK_RETRANSMIT)
+    test.assert_eq(t.timeout_ms, 4000)
+    test.assert_eq(t.retransmits, 1)
+    test.assert_eq(coapmsg.tx_tick(var t, 4000), coapmsg.COAP_TICK_RETRANSMIT)
+    test.assert_eq(t.timeout_ms, 8000)
+    test.assert_eq(coapmsg.tx_tick(var t, 8000), coapmsg.COAP_TICK_RETRANSMIT)
+    test.assert_eq(t.timeout_ms, 16000)
+    test.assert_eq(coapmsg.tx_tick(var t, 16000), coapmsg.COAP_TICK_RETRANSMIT)
+    test.assert_eq(t.timeout_ms, 32000)
+    test.assert_eq(t.retransmits, 4)
+    test.assert_eq(coapmsg.tx_tick(var t, 31999), coapmsg.COAP_TICK_NONE)
+    test.assert_eq(coapmsg.tx_tick(var t, 1), coapmsg.COAP_TICK_GIVE_UP)
+    test.assert_eq(t.state, coapmsg.COAP_TX_TIMED_OUT)
+    test.case("a transmission that has given up has no timer")
+    test.assert_eq(coapmsg.tx_tick(var t, 100000), coapmsg.COAP_TICK_NONE)
+
+@test
+fn test_the_draw_sets_the_first_wait() [io]
+    let tok = coapwire.token(1, 1)
+    test.assert_eq(coapmsg.tx_begin(1, tok, 1000).timeout_ms, 3000)
+    test.assert_eq(coapmsg.tx_begin(1, tok, 500).timeout_ms, 2500)
+    test.assert_eq(coapmsg.tx_begin(1, tok, -5).timeout_ms, 2000)
+    test.assert_eq(coapmsg.tx_begin(1, tok, 5000).timeout_ms, 3000)
+    test.assert_eq(coapmsg.COAP_MAX_TRANSMIT_WAIT_MS, 93000)
+    test.assert_eq(coapmsg.COAP_MAX_TRANSMIT_SPAN_MS, 45000)
+    test.assert_eq(coapmsg.COAP_EXCHANGE_LIFETIME_MS, 247000)
+    test.assert_eq(coapmsg.COAP_NON_LIFETIME_MS, 145000)
+    test.assert_eq(coapmsg.COAP_NSTART, 1)
+    test.assert_eq(coapmsg.COAP_DEFAULT_LEISURE_MS, 5000)
+
+@test
+fn test_a_piggybacked_response_ends_the_wait() [io]
+    let tok = coapwire.token(0x71, 1)
+    var t = coapmsg.tx_begin(0x1234, tok, 0)
+    test.case("a response with the wrong token is not ours")
+    let other = header_of(coapwire.COAP_TYPE_ACK, coapwire.COAP_CONTENT, 0x1234, coapwire.token(0x72, 1))
+    test.assert_eq(coapmsg.tx_on_message(var t, other), coapmsg.COAP_EV_NONE)
+    test.case("an ACK for another message ID is not ours")
+    let elsewhere = header_of(coapwire.COAP_TYPE_ACK, coapwire.COAP_CONTENT, 0x1235, tok)
+    test.assert_eq(coapmsg.tx_on_message(var t, elsewhere), coapmsg.COAP_EV_NONE)
+    test.case("the response with our ID and token")
+    let mine = header_of(coapwire.COAP_TYPE_ACK, coapwire.COAP_CONTENT, 0x1234, tok)
+    test.assert_eq(coapmsg.tx_on_message(var t, mine), coapmsg.COAP_EV_RESPONSE)
+    test.assert_eq(t.state, coapmsg.COAP_TX_DONE)
+    test.case("nothing more is taken, and there is no timer")
+    test.assert_eq(coapmsg.tx_on_message(var t, mine), coapmsg.COAP_EV_NONE)
+    test.assert_eq(coapmsg.tx_tick(var t, 100000), coapmsg.COAP_TICK_NONE)
+
+@test
+fn test_an_empty_ack_then_a_separate_response() [io]
+    let tok = coapwire.token(0x71, 1)
+    var t = coapmsg.tx_begin(0x1234, tok, 0)
+    test.case("the empty ACK says the answer comes later")
+    let ack = header_of(coapwire.COAP_TYPE_ACK, coapwire.COAP_CODE_EMPTY, 0x1234, coapwire.token(0, 0))
+    test.assert_eq(coapmsg.tx_on_message(var t, ack), coapmsg.COAP_EV_ACK)
+    test.assert_eq(t.state, coapmsg.COAP_TX_ACKED)
+    test.assert_eq(coapmsg.tx_tick(var t, 100000), coapmsg.COAP_TICK_NONE)
+    test.case("a request or another token is not the response")
+    let req = header_of(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 9, tok)
+    test.assert_eq(coapmsg.tx_on_message(var t, req), coapmsg.COAP_EV_NONE)
+    let wrong = header_of(coapwire.COAP_TYPE_CON, coapwire.COAP_CONTENT, 9, coapwire.token(0x70, 1))
+    test.assert_eq(coapmsg.tx_on_message(var t, wrong), coapmsg.COAP_EV_NONE)
+    test.case("a RST for the old ID no longer means anything")
+    let rst = header_of(coapwire.COAP_TYPE_RST, coapwire.COAP_CODE_EMPTY, 0x1234, coapwire.token(0, 0))
+    test.assert_eq(coapmsg.tx_on_message(var t, rst), coapmsg.COAP_EV_NONE)
+    test.case("the separate response, confirmable")
+    let sep = header_of(coapwire.COAP_TYPE_CON, coapwire.COAP_CONTENT, 0x4444, tok)
+    test.assert_eq(coapmsg.tx_on_message(var t, sep), coapmsg.COAP_EV_SEPARATE)
+    test.assert_eq(t.state, coapmsg.COAP_TX_DONE)
+
+    test.case("a non-confirmable separate response, with the ACK lost")
+    var u = coapmsg.tx_begin(0x1234, tok, 0)
+    let non = header_of(coapwire.COAP_TYPE_NON, coapwire.COAP_NOT_FOUND, 0x4445, tok)
+    test.assert_eq(coapmsg.tx_on_message(var u, non), coapmsg.COAP_EV_SEPARATE)
+    test.assert_eq(u.state, coapmsg.COAP_TX_DONE)
+
+@test
+fn test_a_reset_ends_the_exchange() [io]
+    let tok = coapwire.token(0x71, 1)
+    var t = coapmsg.tx_begin(0x1234, tok, 0)
+    let elsewhere = header_of(coapwire.COAP_TYPE_RST, coapwire.COAP_CODE_EMPTY, 0x9999, coapwire.token(0, 0))
+    test.assert_eq(coapmsg.tx_on_message(var t, elsewhere), coapmsg.COAP_EV_NONE)
+    let rst = header_of(coapwire.COAP_TYPE_RST, coapwire.COAP_CODE_EMPTY, 0x1234, coapwire.token(0, 0))
+    test.assert_eq(coapmsg.tx_on_message(var t, rst), coapmsg.COAP_EV_RESET)
+    test.assert_eq(t.state, coapmsg.COAP_TX_RESET)
+    test.assert_eq(coapmsg.tx_tick(var t, 100000), coapmsg.COAP_TICK_NONE)
+    test.assert_eq(coapmsg.tx_on_message(var t, rst), coapmsg.COAP_EV_NONE)
+
+@test
+fn test_a_message_with_a_fault_is_not_part_of_an_exchange() [io]
+    var t = coapmsg.tx_begin(1, coapwire.token(0, 0), 0)
+    var bad = msg_of([0x40, 0x01])
+    test.assert_eq(coapmsg.tx_on_message(var t, coapwire.parse(var bad)), coapmsg.COAP_EV_NONE)
+    test.case("a piggybacked ACK whose code is not a response is not either")
+    let odd = header_of(coapwire.COAP_TYPE_ACK, coapwire.COAP_GET, 1, coapwire.token(0, 0))
+    test.assert_eq(coapmsg.tx_on_message(var t, odd), coapmsg.COAP_EV_NONE)
+
+@test
+fn test_the_empty_messages_and_the_ping() [io]
+    var m: coapwire.CoapMsg = Vec.new()
+    // Version 1 (01), type ACK (10), token length 0: 0x60.  Code 0.00, ID.
+    test.assert(coapmsg.build_empty_ack(var m, 0x0102))
+    test.assert_eq(diff(var m, [0x60, 0x00, 0x01, 0x02]), -1)
+    // Type RST (11): 0x70.
+    test.assert(coapmsg.build_reset(var m, 0x0102))
+    test.assert_eq(diff(var m, [0x70, 0x00, 0x01, 0x02]), -1)
+    // Type CON (00): 0x40.
+    test.assert(coapmsg.build_ping(var m, 0xFFFF))
+    test.assert_eq(diff(var m, [0x40, 0x00, 0xFF, 0xFF]), -1)
+    test.assert(coapmsg.is_ping(coapwire.parse(var m)))
+    test.assert(not coapmsg.is_ping(header_of(coapwire.COAP_TYPE_NON, 0, 1, coapwire.token(0, 0))))
+    test.assert(not coapmsg.is_ping(header_of(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 1, coapwire.token(0, 0))))
+    var bad = msg_of([0x40])
+    test.assert(not coapmsg.is_ping(coapwire.parse(var bad)))
+
+@test
+fn test_responses_carry_the_requests_id_and_token() [io]
+    var req: coapwire.CoapMsg = Vec.new()
+    var rb = coapwire.builder()
+    test.assert(coapwire.begin(var req, var rb, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0x1234,
+                               coapwire.token(0x71, 1)))
+    let h = coapwire.parse(var req)
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    // ACK with token length 1: 0x61; code 2.05 = 0x45; the request's ID
+    // 12 34 and token 71.
+    test.assert(coapmsg.build_piggyback(var m, var b, h, coapwire.COAP_CONTENT))
+    test.assert_eq(diff(var m, [0x61, 0x45, 0x12, 0x34, 0x71]), -1)
+    // NON with token length 1: 0x51; an ID of the server's own, 0x00AA.
+    test.assert(coapmsg.build_non_response(var m, var b, h, coapwire.COAP_CONTENT, 0xAA))
+    test.assert_eq(diff(var m, [0x51, 0x45, 0x00, 0xAA, 0x71]), -1)
+    // CON with token length 1: 0x41.
+    test.assert(coapmsg.build_separate(var m, var b, h, coapwire.COAP_CONTENT, 0xAB, true))
+    test.assert_eq(diff(var m, [0x41, 0x45, 0x00, 0xAB, 0x71]), -1)
+    test.assert(coapmsg.build_separate(var m, var b, h, coapwire.COAP_NOT_FOUND, 0xAC, false))
+    test.assert_eq(diff(var m, [0x51, 0x84, 0x00, 0xAC, 0x71]), -1)
+
+@test
+fn test_message_ids_wrap() [io]
+    test.assert_eq(coapmsg.next_mid(0), 1)
+    test.assert_eq(coapmsg.next_mid(65535), 0)
+
+@test
+fn test_the_memory_of_message_ids() [io]
+    test.case("a new ID is not seen, the same one is")
+    var d = coapmsg.dedup()
+    test.assert(not coapmsg.dedup_seen(var d, 9))
+    test.assert(coapmsg.dedup_seen(var d, 9))
+    test.assert(not coapmsg.dedup_seen(var d, 10))
+    test.assert(coapmsg.dedup_seen(var d, 9))
+
+    test.case("the ninth ID replaces the oldest")
+    var e = coapmsg.dedup()
+    test.assert(not coapmsg.dedup_seen(var e, 1))
+    coapmsg.dedup_age(var e, 10)
+    for k in 2..9
+        test.assert(not coapmsg.dedup_seen(var e, k))
+    test.assert(not coapmsg.dedup_seen(var e, 100))
+    test.assert(coapmsg.dedup_seen(var e, 2))
+    test.assert(coapmsg.dedup_seen(var e, 8))
+    test.assert(coapmsg.dedup_seen(var e, 100))
+    test.assert(not coapmsg.dedup_seen(var e, 1))
+
+    test.case("an ID is forgotten after the exchange lifetime")
+    var f = coapmsg.dedup()
+    test.assert(not coapmsg.dedup_seen(var f, 5))
+    coapmsg.dedup_age(var f, 246999)
+    test.assert(coapmsg.dedup_seen(var f, 5))
+    coapmsg.dedup_age(var f, 1)
+    coapmsg.dedup_age(var f, 1)
+    test.assert(not coapmsg.dedup_seen(var f, 5))
+    test.assert(coapmsg.dedup_seen(var f, 5))

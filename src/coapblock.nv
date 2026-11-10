@@ -1,0 +1,343 @@
+// coapblock.nv — block-wise transfer, RFC 7959, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A CoAP message is
+// one datagram, so a resource larger than a datagram is moved in blocks:
+// Block2 splits a response (a client downloads), Block1 splits a request (a
+// client uploads).  Each block is a message of its own and each is
+// acknowledged, so the exchange is lock-step like TFTP's, and a payload
+// that does not fit a message does not need a stream.
+//
+// THE OPTION VALUE is a number built as `NUM << 4 | M << 3 | SZX`.  NUM is
+// the block's number, counting from 0, in a field of 4, 12 or 20 bits as
+// the value takes one, two or three bytes, so it is at most 1048575.  M says
+// that more blocks follow: it is 0 in the last and in a request for a
+// block.  SZX is the size exponent: a block holds `16 << SZX` bytes, from
+// 16 for 0 to 1024 for 6; 7 is reserved.  Every block but the last is full.
+//
+// SIZE IS NEGOTIATED BY THE SERVER'S REPLY.  A client asks for a size with
+// SZX in its request; a server may answer with a smaller one and must not
+// answer with a larger one.  The client then goes on from the byte it has
+// reached in the smaller size, so the position here is a byte offset, and
+// the number of the next block is that offset over the size now in force.
+// The same holds for an upload: a server may lower the size in its
+// 2.31 Continue, and the client goes on at the lower size.
+//
+// WHAT IS HERE.  The value as an option and the other way; the slice of a
+// resource that a block number names, which a server serving a resource of
+// a known length uses; a receiver that takes blocks in order and says what
+// to ask for next, which is a client downloading with Block2 and a server
+// reassembling a request with Block1; and a sender for an upload.  The
+// message exchange around them, the requests and the 2.31 answers, is the
+// caller's, built with `coapwire`.  The Size1 and Size2 hints are options
+// the caller may add with `coapwire.add_uint`.
+
+use coapwire
+
+// The largest SZX: 6, a block of 1024 bytes.
+pub const COAP_SZX_MAX = 6
+// The largest block number: 1048575, which twenty bits hold.
+pub const COAP_BLOCK_NUM_MAX = 1048575
+
+// `blockrx_accept`: the block does not belong; ask again.
+pub const COAP_BLK_REJECT = 0
+// `blockrx_accept`: the block was taken and more follow.
+pub const COAP_BLK_NEXT = 1
+// `blockrx_accept`: the block was taken and it was the last.
+pub const COAP_BLK_FINAL = 2
+
+// A block option read, or to be written.
+//
+// `ok` is false when the option was absent, longer than three bytes, had a
+// size exponent of 7, or a number out of range.
+pub @value
+struct CoapBlock
+    // Whether the option was well formed.
+    ok: Bool
+    // The block number.
+    num: Int
+    // Whether more blocks follow.
+    more: Bool
+    // The size exponent, 0 to 6.
+    szx: Int
+
+// The part of a resource that a block number names.
+pub @value
+struct CoapSlice
+    // False when the block is outside the resource or the size is invalid.
+    ok: Bool
+    // The index of the first byte.
+    offset: Int
+    // How many bytes.
+    len: Int
+    // Whether bytes follow this block.
+    more: Bool
+
+// A transfer being received, one block at a time.
+pub @value
+struct CoapBlockRx
+    // The size exponent in force: the one asked for, lowered when the peer
+    // lowers it.
+    szx: Int
+    // How many bytes have been taken.
+    offset: Int
+    // Whether the last block has been taken.
+    done: Bool
+
+// A transfer being sent, one block at a time.
+pub @value
+struct CoapBlockTx
+    // The size of the whole body in bytes.
+    total: Int
+    // The size exponent in force.
+    szx: Int
+    // The index of the first byte of the block now in flight.
+    offset: Int
+    // Whether the last block has been acknowledged.
+    done: Bool
+    // Whether the peer refused the upload.
+    failed: Bool
+
+// The size in bytes of a block with exponent `szx`: 16 for 0 through 1024
+// for 6, and -1 for anything else.
+//
+// ```novo
+// use coapblock
+//
+// fn main() [io]
+//     println("${coapblock.block_size(0)} ${coapblock.block_size(6)} ${coapblock.block_size(7)}")   // 16 1024 -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn block_size(szx: Int) -> Int []
+    if szx < 0 or szx > COAP_SZX_MAX
+        return -1
+    16 << szx
+
+// The largest exponent whose block fits in `size` bytes, or -1 when `size`
+// is under 16.
+//
+// A device with a buffer of 700 bytes for payload asks for 512.
+pub @tier(embedded)
+@no_alloc
+fn szx_for(size: Int) -> Int []
+    var best = -1
+    for k in 0..7
+        if (16 << k) <= size
+            best = k
+    best
+
+// The block with number `num`, flag `more` and exponent `szx`.
+pub @tier(embedded)
+@no_alloc
+fn block(num: Int, more: Bool, szx: Int) -> CoapBlock []
+    CoapBlock { ok: num >= 0 and num <= COAP_BLOCK_NUM_MAX and szx >= 0 and szx <= COAP_SZX_MAX,
+                num: num, more: more, szx: szx }
+
+// The option value of a block: `NUM << 4 | M << 3 | SZX`, or -1 for a block
+// that is not valid.
+//
+// ```novo
+// use coapblock
+//
+// fn main() [io]
+//     // Block 2, more to come, 64-byte blocks (exponent 2).
+//     println("${coapblock.block_value(coapblock.block(2, true, 2))}")   // 42
+// ```
+pub @tier(embedded)
+@no_alloc
+fn block_value(b: CoapBlock) -> Int []
+    if not b.ok
+        return -1
+    var more = 0
+    if b.more
+        more = 8
+    (b.num << 4) | more | b.szx
+
+// The block an option value stands for.
+//
+// `ok` is false for a negative value, a number over 1048575 and an
+// exponent of 7.
+pub @tier(embedded)
+@no_alloc
+fn block_parse(v: Int) -> CoapBlock []
+    if v < 0 or v > 0xFFFFFF
+        return CoapBlock { ok: false, num: 0, more: false, szx: 0 }
+    CoapBlock { ok: (v & 7) != 7, num: v >> 4, more: (v & 8) != 0, szx: v & 7 }
+
+// The index of the first byte of a block in its resource.
+pub @tier(embedded)
+@no_alloc
+fn block_offset(b: CoapBlock) -> Int []
+    b.num * block_size(b.szx)
+
+// Append a Block1 or Block2 option for `b`.
+//
+// `number` is `COAP_OPT_BLOCK1` or `COAP_OPT_BLOCK2`. Answers false, with
+// the message emptied, when the block is invalid or the option is out of
+// order.
+pub @tier(embedded)
+@no_alloc
+fn add_block(var m: CoapMsg, var bld: CoapBuilder, number: Int, b: CoapBlock) -> Bool []
+    let v = block_value(b)
+    if v < 0
+        m.clear()
+        bld.ok = false
+        return false
+    coapwire.add_uint(var m, var bld, number, v)
+
+// Read the option numbered `number` of a parsed message as a block.
+//
+// `ok` is false when there is no such option or it is not a block.
+pub @tier(embedded)
+@no_alloc
+fn read_block(var m: CoapMsg, h: CoapHeader, number: Int) -> CoapBlock []
+    var it = coapwire.opt_iter(h)
+    for _i in 0..h.len
+        if coapwire.opt_next(var m, var it)
+            if it.number == number
+                if it.value_len > 3
+                    return CoapBlock { ok: false, num: 0, more: false, szx: 0 }
+                return block_parse(coapwire.opt_uint(var m, it))
+    CoapBlock { ok: false, num: 0, more: false, szx: 0 }
+
+// The slice of a body of `total` bytes that block `num` at exponent `szx`
+// names.
+//
+// A server holding a resource serves block `num` of it from the slice. A
+// block that starts at or past the end is not valid, except block 0 of a
+// body of no bytes, which is empty.
+//
+// ```novo
+// use coapblock
+//
+// fn main() [io]
+//     let s = coapblock.slice(100, 1, 1)
+//     println("${s.ok} ${s.offset} ${s.len} ${s.more}")   // true 32 32 true
+//     let last = coapblock.slice(100, 3, 1)
+//     println("${last.ok} ${last.offset} ${last.len} ${last.more}")   // true 96 4 false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn slice(total: Int, num: Int, szx: Int) -> CoapSlice []
+    let size = block_size(szx)
+    if size < 0 or num < 0 or total < 0
+        return CoapSlice { ok: false, offset: 0, len: 0, more: false }
+    let off = num * size
+    if off > total or off == total and total > 0
+        return CoapSlice { ok: false, offset: 0, len: 0, more: false }
+    var len = total - off
+    if len > size
+        len = size
+    CoapSlice { ok: true, offset: off, len: len, more: off + len < total }
+
+// A receiver that wants blocks of exponent `szx`, from the start.
+pub @tier(embedded)
+@no_alloc
+fn blockrx(szx: Int) -> CoapBlockRx []
+    CoapBlockRx { szx: szx, offset: 0, done: false }
+
+// The block option for the request that asks for the next block: its
+// number is the next byte over the size in force, and `more` is clear.
+//
+// ```novo
+// use coapblock
+//
+// fn main() [io]
+//     let rx = coapblock.blockrx(4)
+//     println("${coapblock.block_value(coapblock.blockrx_next(rx))}")   // 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn blockrx_next(rx: CoapBlockRx) -> CoapBlock []
+    block(rx.offset / block_size(rx.szx), false, rx.szx)
+
+// Offer the receiver a block that arrived with `payload_len` bytes.
+//
+// It is taken when it starts where the last one ended, its size is not
+// larger than the one asked for, a block with more to come is full, and no
+// block is longer than its size. A block that is taken may lower the size
+// in force. Answers `COAP_BLK_NEXT` for a block with more to follow,
+// `COAP_BLK_FINAL` for the last, and `COAP_BLK_REJECT` for anything else,
+// in which case the receiver is unchanged. A server reassembling a Block1
+// request answers a rejected block with 4.08, or 4.13 when it is too large;
+// a client downloading asks again.
+//
+// ```novo
+// use coapblock
+//
+// fn main() [io]
+//     var rx = coapblock.blockrx(2)
+//     println("${coapblock.blockrx_accept(var rx, coapblock.block(0, true, 2), 64)}")   // 1
+//     println("${coapblock.blockrx_accept(var rx, coapblock.block(1, false, 2), 10)}")   // 2
+//     println("${rx.offset} ${rx.done}")   // 74 true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn blockrx_accept(var rx: CoapBlockRx, b: CoapBlock, payload_len: Int) -> Int []
+    if rx.done or not b.ok or b.szx > rx.szx or payload_len < 0
+        return COAP_BLK_REJECT
+    let size = block_size(b.szx)
+    if b.num * size != rx.offset or payload_len > size
+        return COAP_BLK_REJECT
+    if b.more and payload_len != size
+        return COAP_BLK_REJECT
+    rx.szx = b.szx
+    rx.offset = rx.offset + payload_len
+    if b.more
+        return COAP_BLK_NEXT
+    rx.done = true
+    COAP_BLK_FINAL
+
+// A sender of a body of `total` bytes in blocks of exponent `szx`.
+pub @tier(embedded)
+@no_alloc
+fn blocktx(total: Int, szx: Int) -> CoapBlockTx []
+    CoapBlockTx { total: total, szx: szx, offset: 0, done: false, failed: false }
+
+// The block to put in the request now in flight: its number, whether more
+// follow, and the exponent in force.
+//
+// `slice(tx.total, b.num, b.szx)` names the bytes it carries.
+pub @tier(embedded)
+@no_alloc
+fn blocktx_current(tx: CoapBlockTx) -> CoapBlock []
+    let size = block_size(tx.szx)
+    block(tx.offset / size, tx.offset + size < tx.total, tx.szx)
+
+// Give the sender the answer to the block in flight, from its `code` and
+// the Block1 option the answer carried.
+//
+// A 2.31 Continue moves to the next block, and lowers the size in force if
+// the answer's option has a smaller exponent. A success code ends the
+// upload. Any other code fails it. Answers `COAP_BLK_NEXT` to send the next
+// block, `COAP_BLK_FINAL` when the upload is complete and
+// `COAP_BLK_REJECT` when it failed.
+//
+// ```novo
+// use coapblock
+// use coapwire
+//
+// fn main() [io]
+//     var tx = coapblock.blocktx(100, 1)
+//     let r = coapblock.blocktx_on_response(var tx, coapwire.COAP_CONTINUE, coapblock.block(0, true, 1))
+//     println("${r} ${tx.offset}")   // 1 32
+// ```
+pub @tier(embedded)
+@no_alloc
+fn blocktx_on_response(var tx: CoapBlockTx, code: Int, b: CoapBlock) -> Int []
+    if tx.done or tx.failed
+        return COAP_BLK_REJECT
+    if code == COAP_CONTINUE
+        let size = block_size(tx.szx)
+        if tx.offset + size >= tx.total
+            tx.done = true
+            return COAP_BLK_FINAL
+        tx.offset = tx.offset + size
+        if b.ok and b.szx < tx.szx
+            tx.szx = b.szx
+        return COAP_BLK_NEXT
+    if coapwire.code_class(code) == 2
+        tx.done = true
+        return COAP_BLK_FINAL
+    tx.failed = true
+    COAP_BLK_REJECT

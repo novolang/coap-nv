@@ -1,0 +1,147 @@
+// coapobs_tests.nv — observing a resource, RFC 7641.
+//
+// The freshness rule is section 3.4: with V1 the number of the newest
+// notification taken and V2 the number of a new one, the new one is newer
+// when V1 < V2 and V2 - V1 < 2^23, or V1 > V2 and V1 - V2 > 2^23, or more
+// than 128 seconds have passed.  2^23 is 8388608.  The numbers are 24
+// bits, so the largest is 16777215.
+
+use std.test
+use coapobs
+use coapwire
+
+// Set a sequence counter, which a local table cannot be written through.
+fn set_seq(var t: coapobs.CoapObservers, resource: Int, v: Int)
+    t.seq[resource] = v
+
+@test
+fn test_which_notification_is_newer() [io]
+    test.case("a higher number is newer, a lower one is not")
+    test.assert(coapobs.observe_newer(5, 6, 0))
+    test.assert(not coapobs.observe_newer(6, 5, 0))
+    test.assert(not coapobs.observe_newer(5, 5, 0))
+    test.case("the gap is judged on a circle")
+    test.assert(coapobs.observe_newer(16777215, 2, 0))
+    test.assert(not coapobs.observe_newer(2, 16777215, 0))
+    test.case("exactly half the circle is newer in neither direction")
+    test.assert(not coapobs.observe_newer(0, 8388608, 0))
+    test.assert(not coapobs.observe_newer(8388608, 0, 0))
+    test.assert(coapobs.observe_newer(0, 8388607, 0))
+    test.assert(coapobs.observe_newer(8388609, 0, 0))
+    test.case("after 128 seconds whatever arrives is newer")
+    test.assert(not coapobs.observe_newer(6, 5, 128000))
+    test.assert(coapobs.observe_newer(6, 5, 128001))
+    test.case("only 24 bits count")
+    test.assert(coapobs.observe_newer(0x1000005, 0x1000006, 0))
+
+@test
+fn test_the_sequence_wraps_at_24_bits() [io]
+    test.assert_eq(coapobs.observe_seq_next(0), 1)
+    test.assert_eq(coapobs.observe_seq_next(16777215), 0)
+    test.assert_eq(coapobs.COAP_OBSERVE_REGISTER, 0)
+    test.assert_eq(coapobs.COAP_OBSERVE_DEREGISTER, 1)
+    test.assert_eq(coapobs.COAP_OBSERVE_SEQ_MAX, 16777215)
+    test.assert_eq(coapobs.COAP_OBSERVE_WINDOW_MS, 128000)
+
+@test
+fn test_the_observe_option_of_a_request() [io]
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.assert(coapwire.begin(var m, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 1,
+                               coapwire.token(0, 0)))
+    test.assert_eq(coapobs.request_observe(var m, coapwire.parse(var m)), -1)
+    // Observe is option 6, with the value 0 (no bytes): delta 6, length 0.
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_OBSERVE, 0))
+    test.assert_eq(m[4] as Int, 0x60)
+    test.assert_eq(coapobs.request_observe(var m, coapwire.parse(var m)), 0)
+    test.assert(coapwire.begin(var m, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 1,
+                               coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_OBSERVE, 1))
+    test.assert_eq(coapobs.request_observe(var m, coapwire.parse(var m)), 1)
+
+@test
+fn test_registering_observers() [io]
+    var t = coapobs.observers()
+    let a = coapwire.token(0xAB, 1)
+    let b = coapwire.token(0xAC, 1)
+    test.case("a new observer, then the same one again")
+    test.assert_eq(coapobs.obs_register(var t, 3, 7, a), coapobs.COAP_OBS_ADDED)
+    test.assert_eq(coapobs.obs_register(var t, 3, 7, a), coapobs.COAP_OBS_KNOWN)
+    test.assert_eq(coapobs.obs_count(var t, 3), 1)
+    test.case("the same peer with another token is another observation")
+    test.assert_eq(coapobs.obs_register(var t, 3, 7, b), coapobs.COAP_OBS_ADDED)
+    test.assert_eq(coapobs.obs_count(var t, 3), 2)
+    test.case("another peer, another resource")
+    test.assert_eq(coapobs.obs_register(var t, 3, 8, a), coapobs.COAP_OBS_ADDED)
+    test.assert_eq(coapobs.obs_register(var t, 4, 7, coapwire.token(0xAD, 1)), coapobs.COAP_OBS_ADDED)
+    test.assert_eq(coapobs.obs_count(var t, 3), 3)
+    test.assert_eq(coapobs.obs_count(var t, 4), 1)
+    test.assert_eq(coapobs.obs_count(var t, 5), 0)
+
+    test.case("walking the observers of a resource")
+    var seen = 0
+    var i = coapobs.obs_find(var t, 3, 0)
+    for _k in 0..8
+        if i >= 0
+            seen = seen + 1
+            i = coapobs.obs_find(var t, 3, i + 1)
+    test.assert_eq(seen, 3)
+    let first = coapobs.obs_find(var t, 3, 0)
+    test.assert_eq(coapobs.obs_peer(var t, first), 7)
+    test.assert(coapwire.token_eq(coapobs.obs_token(var t, first), a))
+    test.assert_eq(coapobs.obs_find(var t, 5, 0), -1)
+
+    test.case("a resource out of range cannot be observed")
+    test.assert_eq(coapobs.obs_register(var t, 8, 1, a), coapobs.COAP_OBS_FULL)
+    test.assert_eq(coapobs.obs_register(var t, -1, 1, a), coapobs.COAP_OBS_FULL)
+
+@test
+fn test_a_full_table_and_the_ways_out_of_it() [io]
+    var t = coapobs.observers()
+    for k in 0..8
+        test.assert_eq(coapobs.obs_register(var t, 0, k, coapwire.token(k, 1)), coapobs.COAP_OBS_ADDED)
+    test.assert_eq(coapobs.obs_register(var t, 0, 99, coapwire.token(99, 1)), coapobs.COAP_OBS_FULL)
+    test.case("deregistering frees a slot")
+    test.assert(coapobs.obs_deregister(var t, 3, coapwire.token(3, 1)))
+    test.assert(not coapobs.obs_deregister(var t, 3, coapwire.token(3, 1)))
+    test.assert_eq(coapobs.obs_register(var t, 0, 99, coapwire.token(99, 1)), coapobs.COAP_OBS_ADDED)
+    test.case("a peer that is gone takes all its observations")
+    test.assert_eq(coapobs.obs_register(var t, 1, 5, coapwire.token(5, 2)), coapobs.COAP_OBS_FULL)
+    test.assert_eq(coapobs.obs_drop_peer(var t, 99), 1)
+    test.assert_eq(coapobs.obs_drop_peer(var t, 99), 0)
+    test.assert_eq(coapobs.obs_register(var t, 1, 5, coapwire.token(5, 2)), coapobs.COAP_OBS_ADDED)
+    test.assert_eq(coapobs.obs_drop_peer(var t, 5), 2)
+    test.case("a token of another length is another token")
+    test.assert_eq(coapobs.obs_register(var t, 0, 1, coapwire.token(1, 2)), coapobs.COAP_OBS_ADDED)
+
+@test
+fn test_sequence_numbers_per_resource() [io]
+    var t = coapobs.observers()
+    test.assert_eq(coapobs.obs_next_seq(var t, 0), 1)
+    test.assert_eq(coapobs.obs_next_seq(var t, 0), 2)
+    test.assert_eq(coapobs.obs_next_seq(var t, 1), 1)
+    set_seq(var t, 2, 16777215)
+    test.assert_eq(coapobs.obs_next_seq(var t, 2), 0)
+    test.assert_eq(coapobs.obs_next_seq(var t, 2), 1)
+
+@test
+fn test_a_reset_removes_the_observer_it_answers() [io]
+    var t = coapobs.observers()
+    let a = coapwire.token(0xAB, 1)
+    test.assert_eq(coapobs.obs_register(var t, 3, 7, a), coapobs.COAP_OBS_ADDED)
+    test.assert_eq(coapobs.obs_register(var t, 3, 8, a), coapobs.COAP_OBS_ADDED)
+    let s7 = coapobs.obs_find(var t, 3, 0)
+    let s8 = coapobs.obs_find(var t, 3, s7 + 1)
+    coapobs.obs_note_mid(var t, s7, 100)
+    coapobs.obs_note_mid(var t, s8, 101)
+    test.case("a reset of an ID no notification used removes nothing")
+    test.assert(not coapobs.obs_reset(var t, 7, 101))
+    test.assert(not coapobs.obs_reset(var t, 7, 55))
+    test.assert_eq(coapobs.obs_count(var t, 3), 2)
+    test.case("a reset from the right peer for the right ID does")
+    test.assert(coapobs.obs_reset(var t, 7, 100))
+    test.assert_eq(coapobs.obs_count(var t, 3), 1)
+    test.assert(not coapobs.obs_reset(var t, 7, 100))
+    test.case("a new registration has no notification yet")
+    test.assert_eq(coapobs.obs_register(var t, 3, 7, a), coapobs.COAP_OBS_ADDED)
+    test.assert(not coapobs.obs_reset(var t, 7, -1))

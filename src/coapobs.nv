@@ -1,0 +1,268 @@
+// coapobs.nv — observing a resource, RFC 7641, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A client that adds
+// the Observe option, with the value 0, to a GET registers itself as an
+// observer of the resource.  The server answers the GET as usual and then
+// sends the client a further response, a notification, each time the
+// resource changes.  Every notification carries the request's token, so the
+// client matches it to the registration, and an Observe option holding a
+// sequence number.  The client deregisters with the value 1, or by
+// answering a notification with a reset.
+//
+// THE SEQUENCE RULE, section 3.4.  Notifications can arrive out of order,
+// so the client keeps the sequence number and the time of the newest one it
+// has taken, and takes a new one only if it is newer.  The number is 24
+// bits wide and wraps, so "newer" is a comparison on a circle: V2 is newer
+// than V1 when V1 < V2 and V2 - V1 < 2^23, or V1 > V2 and V1 - V2 > 2^23,
+// and also when more than 128 seconds have passed since V1, whatever the
+// numbers, because a server that restarted starts again from a small
+// number.  `observe_newer` is that rule and nothing else.
+//
+// THE OBSERVER TABLE is what a server keeps: for each client, the peer, the
+// token it registered with and the resource it observes, in a table of
+// eight fixed slots, and for each resource a sequence number to put in the
+// next notification.  The peer is a number the caller chooses to name an
+// endpoint (an index into its own table of addresses), because this package
+// sees no addresses. The table forgets a client that deregisters, one whose
+// notification was answered with a reset, and one whose peer the caller
+// says is gone.  A resource is numbered from 0 to 7, which is its index in
+// the caller's table of resources.
+//
+// A NOTIFICATION IS A RESPONSE built with `coapmsg.build_separate`, with
+// the observer's token, and with the Observe option from
+// `coapwire.add_uint(..., COAP_OPT_OBSERVE, seq)` where `seq` is
+// `obs_next_seq`. It is confirmable now and then (RFC 7641 asks for one at
+// least every 24 hours) and non-confirmable between; which is the caller's
+// choice.
+
+use coapwire
+
+// The Observe value that registers: 0.
+pub const COAP_OBSERVE_REGISTER = 0
+// The Observe value that deregisters: 1.
+pub const COAP_OBSERVE_DEREGISTER = 1
+// The largest sequence number: 16777215, which 24 bits hold.
+pub const COAP_OBSERVE_SEQ_MAX = 16777215
+// How long a notification stays the newest regardless of its number, in
+// milliseconds: 128000.
+pub const COAP_OBSERVE_WINDOW_MS = 128000
+
+// `obs_register`: a new observer was added.
+pub const COAP_OBS_ADDED = 1
+// `obs_register`: the peer and token were already registered, and the
+// entry is as it was.
+pub const COAP_OBS_KNOWN = 2
+// `obs_register`: the table is full.
+pub const COAP_OBS_FULL = 0
+
+// The observers of a server, and its sequence counters.
+pub @value
+struct CoapObservers
+    // The resource each slot observes, or -1 for an empty slot.
+    resource: Vec[Int; 8]
+    // The peer of each slot.
+    peer: Vec[Int; 8]
+    // The token length of each slot.
+    token_len: Vec[Int; 8]
+    // The token bytes of each slot.
+    token_value: Vec[Int; 8]
+    // The message ID of the last notification sent to each slot.
+    last_mid: Vec[Int; 8]
+    // The next sequence number for each resource.
+    seq: Vec[Int; 8]
+
+// Whether a notification with sequence number `v2`, which arrived
+// `elapsed_ms` after the one numbered `v1`, is newer than it.
+//
+// Both numbers are held to 24 bits.
+//
+// ```novo
+// use coapobs
+//
+// fn main() [io]
+//     println("${coapobs.observe_newer(5, 6, 0)}")   // true
+//     println("${coapobs.observe_newer(6, 5, 0)}")   // false
+//     println("${coapobs.observe_newer(16777215, 2, 0)}")   // true, the counter wrapped
+//     println("${coapobs.observe_newer(6, 5, 130000)}")   // true, 128 seconds have passed
+// ```
+pub @tier(embedded)
+@no_alloc
+fn observe_newer(v1: Int, v2: Int, elapsed_ms: Int) -> Bool []
+    let a = v1 & COAP_OBSERVE_SEQ_MAX
+    let b = v2 & COAP_OBSERVE_SEQ_MAX
+    if a < b and b - a < 8388608
+        return true
+    if a > b and a - b > 8388608
+        return true
+    elapsed_ms > COAP_OBSERVE_WINDOW_MS
+
+// The sequence number that follows `n`: one more, wrapping at 24 bits.
+pub @tier(embedded)
+@no_alloc
+fn observe_seq_next(n: Int) -> Int []
+    (n + 1) & COAP_OBSERVE_SEQ_MAX
+
+// The value of the Observe option of a parsed request: 0 to register, 1 to
+// deregister, or -1 when the request has none.
+pub @tier(embedded)
+@no_alloc
+fn request_observe(var m: CoapMsg, h: CoapHeader) -> Int []
+    coapwire.find_uint(var m, h, COAP_OPT_OBSERVE)
+
+// An observer table with no observers.
+pub @tier(embedded)
+@no_alloc
+fn observers() -> CoapObservers []
+    var resource: Vec[Int; 8] = Vec.new()
+    var peer: Vec[Int; 8] = Vec.new()
+    var token_len: Vec[Int; 8] = Vec.new()
+    var token_value: Vec[Int; 8] = Vec.new()
+    var last_mid: Vec[Int; 8] = Vec.new()
+    var seq: Vec[Int; 8] = Vec.new()
+    for _i in 0..8
+        let _a = resource.push(-1)
+        let _b = peer.push(0)
+        let _c = token_len.push(0)
+        let _d = token_value.push(0)
+        let _e = last_mid.push(-1)
+        let _f = seq.push(0)
+    CoapObservers { resource: resource, peer: peer, token_len: token_len,
+                    token_value: token_value, last_mid: last_mid, seq: seq }
+
+// The slot that holds the observer `peer` with token `tok`, or -1.
+@tier(embedded)
+@no_alloc
+fn slot_of(var t: CoapObservers, peer: Int, tok: CoapToken) -> Int []
+    for i in 0..8
+        if t.resource[i] >= 0 and t.peer[i] == peer and t.token_len[i] == tok.len
+            and t.token_value[i] == tok.value
+            return i
+    -1
+
+// Register an observer: the peer, the token it sent, and the resource
+// (0 to 7).
+//
+// A peer and a token name one observation (section 4.1). A peer that
+// registers again with the same token is already registered, and the
+// observation is kept, for the resource named now; one with a different
+// token is another observation. Answers `COAP_OBS_ADDED`, `COAP_OBS_KNOWN`, or
+// `COAP_OBS_FULL` when the table has no free slot, in which case the
+// server answers the GET without the Observe option and the client has an
+// ordinary response.
+//
+// ```novo
+// use coapobs
+// use coapwire
+//
+// fn main() [io]
+//     var t = coapobs.observers()
+//     let tok = coapwire.token(0xAB, 1)
+//     println("${coapobs.obs_register(var t, 3, 7, tok)} ${coapobs.obs_register(var t, 3, 7, tok)}")   // 1 2
+//     println("${coapobs.obs_count(var t, 3)}")   // 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn obs_register(var t: CoapObservers, resource: Int, peer: Int, tok: CoapToken) -> Int []
+    if resource < 0 or resource > 7
+        return COAP_OBS_FULL
+    let known = slot_of(var t, peer, tok)
+    if known >= 0
+        // The peer and the token name the observation; asking again, for
+        // this resource or another, leaves one.
+        t.resource[known] = resource
+        return COAP_OBS_KNOWN
+    for i in 0..8
+        if t.resource[i] < 0
+            t.resource[i] = resource
+            t.peer[i] = peer
+            t.token_len[i] = tok.len
+            t.token_value[i] = tok.value
+            t.last_mid[i] = -1
+            return COAP_OBS_ADDED
+    COAP_OBS_FULL
+
+// Remove an observer: a deregistering GET, or a reset of its token. Answers
+// whether it was there.
+pub @tier(embedded)
+@no_alloc
+fn obs_deregister(var t: CoapObservers, peer: Int, tok: CoapToken) -> Bool []
+    let i = slot_of(var t, peer, tok)
+    if i < 0
+        return false
+    t.resource[i] = -1
+    true
+
+// Remove every observer of a peer that is gone, and answer how many there
+// were.
+pub @tier(embedded)
+@no_alloc
+fn obs_drop_peer(var t: CoapObservers, peer: Int) -> Int []
+    var n = 0
+    for i in 0..8
+        if t.resource[i] >= 0 and t.peer[i] == peer
+            t.resource[i] = -1
+            n = n + 1
+    n
+
+// How many observers a resource has.
+pub @tier(embedded)
+@no_alloc
+fn obs_count(var t: CoapObservers, resource: Int) -> Int []
+    var n = 0
+    for i in 0..8
+        if t.resource[i] == resource
+            n = n + 1
+    n
+
+// The next slot at or after `from` that observes `resource`, or -1.
+//
+// A server notifying a resource walks the slots with it:
+// `i = obs_find(t, r, 0)`, then `i = obs_find(t, r, i + 1)` until -1.
+pub @tier(embedded)
+@no_alloc
+fn obs_find(var t: CoapObservers, resource: Int, from: Int) -> Int []
+    for i in from..8
+        if t.resource[i] == resource
+            return i
+    -1
+
+// The peer of a slot.
+pub @tier(embedded)
+@no_alloc
+fn obs_peer(var t: CoapObservers, slot: Int) -> Int []
+    t.peer[slot]
+
+// The token of a slot.
+pub @tier(embedded)
+@no_alloc
+fn obs_token(var t: CoapObservers, slot: Int) -> CoapToken []
+    CoapToken { len: t.token_len[slot], value: t.token_value[slot] }
+
+// The sequence number for the next notification of a resource, which is
+// then advanced.
+//
+// All the observers of a resource are sent the same number, so call it once
+// per change and not once per observer. The first is 1 so that the
+// registration response, which carries 0 or the current number, is older.
+pub @tier(embedded)
+@no_alloc
+fn obs_next_seq(var t: CoapObservers, resource: Int) -> Int []
+    t.seq[resource] = observe_seq_next(t.seq[resource])
+    t.seq[resource]
+
+// Record the message ID of the notification just sent to a slot.
+pub @tier(embedded)
+@no_alloc
+fn obs_note_mid(var t: CoapObservers, slot: Int, mid: Int) []
+    t.last_mid[slot] = mid
+
+// A reset arrived for message `mid` from `peer`: remove the observer whose
+// last notification it was. Answers whether there was one.
+pub @tier(embedded)
+@no_alloc
+fn obs_reset(var t: CoapObservers, peer: Int, mid: Int) -> Bool []
+    for i in 0..8
+        if mid >= 0 and t.resource[i] >= 0 and t.peer[i] == peer and t.last_mid[i] == mid
+            t.resource[i] = -1
+            return true
+    false

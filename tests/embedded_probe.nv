@@ -1,0 +1,182 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS A SENSOR NODE: a Cortex-M that answers CoAP requests
+// over UDP, offers its readings to observers, serves a configuration blob
+// in blocks and sends a confirmable request of its own with the
+// retransmission the RFC asks for, all with no heap.  Everything it decides
+// is here and is compiled for the hardware rather than claimed.  The
+// datagram socket is the caller's, so the probe passes the messages between
+// the two ends in memory.
+//
+// What it checks, with the number of checks each adds:
+//
+//   - the RFC 7252 example request, "GET /temperature", parsed (3)
+//   - a server over a table of two resources answering a confirmable GET with
+//     a piggybacked 2.05 and a payload, and a repeat of it as a duplicate (4)
+//   - a confirmable request sent with the retransmission schedule of
+//     section 4.2 until it gives up (2)
+//   - a resource of 1500 bytes downloaded in blocks of 512 with Block2 (2)
+//   - one observer registered and two notifications numbered (2)
+//
+// The score is the sum, and a device that disagrees with the host prints how
+// many it lost.
+
+use std.str
+use coapblock
+use coapmsg
+use coapobs
+use coapserver
+use coapwire
+
+// A table of two resources: the temperature, and a blob.
+@value
+struct Sensor
+    // Unused; a `@value` needs a field.
+    unused: Int
+
+impl CoapResources[] for Sensor
+    @tier(embedded)
+    fn res_count(self) -> Int []
+        2
+
+    @tier(embedded)
+    fn res_path(self, i: Int) -> Str []
+        if i == 0
+            return "temperature"
+        "blob"
+
+    @tier(embedded)
+    fn res_methods(self, i: Int) -> Int []
+        coapserver.COAP_M_GET
+
+    @tier(embedded)
+    fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader, var resp: CoapMsg,
+                  var b: CoapBuilder) -> Int []
+        if i == 0
+            let _ = coapwire.start_payload(var resp, var b)
+            let _ = coapwire.push_payload_str(var resp, var b, "22.3 C")
+            return coapwire.COAP_CONTENT
+        coapwire.COAP_NOT_IMPLEMENTED
+
+// The RFC's example request, built and read back: three checks.
+@tier(embedded)
+@no_alloc
+fn rfc_score() -> Int []
+    var n = 0
+    var m: CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    let ok = coapwire.begin(var m, var b, COAP_TYPE_CON, COAP_GET, 0x7D34, coapwire.token(0, 0))
+    let _ = coapwire.add_path(var m, var b, "temperature")
+    if ok and m.len() == 16 and m[4] == 0xBB
+        n = n + 1
+    let h = coapwire.parse(var m)
+    if coapwire.header_ok(h) and h.mid == 0x7D34
+        n = n + 1
+    if coapwire.path_is(var m, h, "/temperature")
+        n = n + 1
+    n
+
+// A server answering a request and recognising its repeat: four checks.
+@tier(embedded)
+@no_alloc
+fn server_score() -> Int []
+    var n = 0
+    var req: CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    let _ = coapwire.begin(var req, var b, COAP_TYPE_CON, COAP_GET, 0x1234, coapwire.token(0x71, 1))
+    let _ = coapwire.add_path(var req, var b, "temperature")
+    var resp: CoapMsg = Vec.new()
+    var d = coapmsg.dedup()
+    let table = Sensor { unused: 0 }
+    if coapserver.serve(table, var req, var resp, var d, 1) == coapserver.COAP_SERVE_REPLY
+        n = n + 1
+    let h = coapwire.parse(var resp)
+    if h.kind == COAP_TYPE_ACK and h.code == COAP_CONTENT and h.mid == 0x1234
+        n = n + 1
+    if coapwire.payload_len(h) == 6 and coapwire.payload_byte(var resp, h, 0) == 50
+        n = n + 1
+    if coapserver.serve(table, var req, var resp, var d, 1) == coapserver.COAP_SERVE_DUPLICATE
+        n = n + 1
+    n
+
+// A confirmable request on its way, sent again at 2, 4, 8, 16 seconds and
+// then given up on: two checks.
+@tier(embedded)
+@no_alloc
+fn schedule_score() -> Int []
+    var n = 0
+    var t = coapmsg.tx_begin(7, coapwire.token(1, 1), 0)
+    var repeats = 0
+    var gave_up = false
+    for _i in 0..8
+        let action = coapmsg.tx_tick(var t, t.timeout_ms)
+        if action == coapmsg.COAP_TICK_RETRANSMIT
+            repeats = repeats + 1
+        if action == coapmsg.COAP_TICK_GIVE_UP
+            gave_up = true
+    if repeats == 4
+        n = n + 1
+    if gave_up and t.state == coapmsg.COAP_TX_TIMED_OUT
+        n = n + 1
+    n
+
+// A resource of 1500 bytes read by a client in blocks of 512: two checks.
+@tier(embedded)
+@no_alloc
+fn block_score() -> Int []
+    var n = 0
+    var rx = coapblock.blockrx(5)
+    var rounds = 0
+    var taken = 0
+    for _i in 0..8
+        if not rx.done
+            rounds = rounds + 1
+            let want = coapblock.blockrx_next(rx)
+            let s = coapblock.slice(1500, want.num, want.szx)
+            let r = coapblock.blockrx_accept(var rx, coapblock.block(want.num, s.more, want.szx), s.len)
+            if r != coapblock.COAP_BLK_REJECT
+                taken = taken + s.len
+    if rounds == 3 and rx.done
+        n = n + 1
+    if taken == 1500
+        n = n + 1
+    n
+
+// One observer and two notifications: two checks.
+@tier(embedded)
+@no_alloc
+fn observe_score() -> Int []
+    var n = 0
+    var t = coapobs.observers()
+    let tok = coapwire.token(0xAB, 1)
+    if coapobs.obs_register(var t, 0, 7, tok) == coapobs.COAP_OBS_ADDED
+        and coapobs.obs_count(var t, 0) == 1
+        n = n + 1
+    let first = coapobs.obs_next_seq(var t, 0)
+    let second = coapobs.obs_next_seq(var t, 0)
+    if coapobs.observe_newer(first, second, 0) and not coapobs.observe_newer(second, first, 0)
+        n = n + 1
+    n
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.
+@tier(embedded)
+fn score() -> Int []
+    rfc_score() + server_score() + schedule_score() + block_score() + observe_score()
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 13 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says how many it lost.
+    let n = score()
+    if n == 13
+        hal.uart.write("PASS: coap-embedded\n")
+    else
+        hal.uart.write("FAIL: coap-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        hal.timer.delay_ms(1000)

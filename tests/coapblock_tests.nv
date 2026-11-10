@@ -1,0 +1,301 @@
+// coapblock_tests.nv — block-wise transfer, RFC 7959.
+//
+// The option value is `NUM << 4 | M << 3 | SZX`.  The size is `16 << SZX`:
+// SZX 0 is 16 bytes, 1 is 32, 2 is 64, 3 is 128, 4 is 256, 5 is 512 and 6
+// is 1024.  The values below are worked out by hand from that.  Block 2
+// with more to come at SZX 2 is 2 * 16 + 8 + 2 = 42.  The option number of
+// Block2 is 23, which is 10 more than 13, so the head of the option after
+// the header is delta nibble 13, length nibble 1 and the byte 10: D1 0A,
+// and the value 2A follows.
+
+use std.test
+use coapblock
+use coapwire
+
+// A message from a list of byte values.
+fn msg_of(xs: [Int]) -> coapwire.CoapMsg
+    var m: coapwire.CoapMsg = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+// The index of the first byte of the message that differs from the
+// expected list, -2 when the lengths differ, and -1 when they agree.
+fn diff(var m: coapwire.CoapMsg, want: [Int]) -> Int
+    if m.len() != list.len(want)
+        return -2
+    for i in 0..m.len()
+        if (m[i] as Int) != want[i]
+            return i
+    -1
+
+@test
+fn test_sizes() [io]
+    test.case("SZX 0 through 6 are 16 through 1024 bytes")
+    test.assert_eq(coapblock.block_size(0), 16)
+    test.assert_eq(coapblock.block_size(1), 32)
+    test.assert_eq(coapblock.block_size(2), 64)
+    test.assert_eq(coapblock.block_size(3), 128)
+    test.assert_eq(coapblock.block_size(4), 256)
+    test.assert_eq(coapblock.block_size(5), 512)
+    test.assert_eq(coapblock.block_size(6), 1024)
+    test.case("7 is reserved and negative is nothing")
+    test.assert_eq(coapblock.block_size(7), -1)
+    test.assert_eq(coapblock.block_size(-1), -1)
+    test.case("the exponent for a buffer")
+    test.assert_eq(coapblock.szx_for(15), -1)
+    test.assert_eq(coapblock.szx_for(16), 0)
+    test.assert_eq(coapblock.szx_for(63), 1)
+    test.assert_eq(coapblock.szx_for(700), 5)
+    test.assert_eq(coapblock.szx_for(1024), 6)
+    test.assert_eq(coapblock.szx_for(5000), 6)
+    test.assert_eq(coapblock.COAP_SZX_MAX, 6)
+    test.assert_eq(coapblock.COAP_BLOCK_NUM_MAX, 1048575)
+
+@test
+fn test_the_option_value() [io]
+    test.case("block 2, more, 64 bytes is 42")
+    test.assert_eq(coapblock.block_value(coapblock.block(2, true, 2)), 42)
+    test.case("block 0, last, 16 bytes is 0")
+    test.assert_eq(coapblock.block_value(coapblock.block(0, false, 0)), 0)
+    test.case("the largest number at the largest size")
+    test.assert_eq(coapblock.block_value(coapblock.block(1048575, true, 6)), 16777214)
+    test.case("a block out of range has no value")
+    test.assert_eq(coapblock.block_value(coapblock.block(1048576, false, 0)), -1)
+    test.assert_eq(coapblock.block_value(coapblock.block(-1, false, 0)), -1)
+    test.assert_eq(coapblock.block_value(coapblock.block(0, false, 7)), -1)
+    test.assert_eq(coapblock.block_value(coapblock.block(0, false, -1)), -1)
+
+    test.case("a value read back")
+    let b = coapblock.block_parse(42)
+    test.assert(b.ok)
+    test.assert_eq(b.num, 2)
+    test.assert(b.more)
+    test.assert_eq(b.szx, 2)
+    let last = coapblock.block_parse(0x31)
+    test.assert(last.ok)
+    test.assert_eq(last.num, 3)
+    test.assert(not last.more)
+    test.assert_eq(last.szx, 1)
+    test.case("an exponent of 7, a negative value and one past 24 bits")
+    test.assert(not coapblock.block_parse(7).ok)
+    test.assert(not coapblock.block_parse(-1).ok)
+    test.assert(not coapblock.block_parse(0x1000000).ok)
+    test.assert(not coapblock.block_parse(0xFFFFFF).ok)
+    test.assert(coapblock.block_parse(0xFFFFFE).ok)
+    test.assert_eq(coapblock.block_parse(0xFFFFFE).num, 1048575)
+
+    test.case("the byte offset of a block")
+    test.assert_eq(coapblock.block_offset(coapblock.block(3, false, 4)), 768)
+
+@test
+fn test_the_option_in_a_message() [io]
+    var m: coapwire.CoapMsg = Vec.new()
+    var bld = coapwire.builder()
+    test.assert(coapwire.begin(var m, var bld, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0,
+                               coapwire.token(0, 0)))
+    test.assert(coapblock.add_block(var m, var bld, coapwire.COAP_OPT_BLOCK2,
+                                    coapblock.block(2, true, 2)))
+    test.assert_eq(diff(var m, [0x40, 0x01, 0x00, 0x00, 0xD1, 0x0A, 0x2A]), -1)
+    let h = coapwire.parse(var m)
+    let b = coapblock.read_block(var m, h, coapwire.COAP_OPT_BLOCK2)
+    test.assert(b.ok)
+    test.assert_eq(b.num, 2)
+    test.assert(b.more)
+    test.assert_eq(b.szx, 2)
+
+    test.case("a number over 15 takes two bytes")
+    test.assert(coapwire.begin(var m, var bld, coapwire.COAP_TYPE_CON, coapwire.COAP_PUT, 0,
+                               coapwire.token(0, 0)))
+    test.assert(coapblock.add_block(var m, var bld, coapwire.COAP_OPT_BLOCK1,
+                                    coapblock.block(16, false, 6)))
+    // Block1 is option 27, 14 more than 13: nibble 13, ext 14 = 0x0E.
+    // Value 16 * 16 + 6 = 262 = 01 06.
+    test.assert_eq(diff(var m, [0x40, 0x03, 0x00, 0x00, 0xD2, 0x0E, 0x01, 0x06]), -1)
+    let r = coapblock.read_block(var m, coapwire.parse(var m), coapwire.COAP_OPT_BLOCK1)
+    test.assert_eq(r.num, 16)
+    test.assert_eq(r.szx, 6)
+
+    test.case("an option that is absent, or too long, or not a block")
+    test.assert(not coapblock.read_block(var m, coapwire.parse(var m), coapwire.COAP_OPT_BLOCK2).ok)
+    test.assert(coapwire.begin(var m, var bld, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0,
+                               coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var bld, coapwire.COAP_OPT_BLOCK2, 0x01000000))
+    test.assert(not coapblock.read_block(var m, coapwire.parse(var m), coapwire.COAP_OPT_BLOCK2).ok)
+    test.assert(coapwire.begin(var m, var bld, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0,
+                               coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var bld, coapwire.COAP_OPT_BLOCK2, 7))
+    test.assert(not coapblock.read_block(var m, coapwire.parse(var m), coapwire.COAP_OPT_BLOCK2).ok)
+
+    test.case("a block that is not valid is not written")
+    test.assert(coapwire.begin(var m, var bld, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0,
+                               coapwire.token(0, 0)))
+    test.assert(not coapblock.add_block(var m, var bld, coapwire.COAP_OPT_BLOCK2,
+                                        coapblock.block(0, false, 7)))
+    test.assert_eq(m.len(), 0)
+    test.assert(not bld.ok)
+
+@test
+fn test_the_slice_of_a_body() [io]
+    test.case("a body of 100 bytes in blocks of 32")
+    let a = coapblock.slice(100, 0, 1)
+    test.assert(a.ok)
+    test.assert_eq(a.offset, 0)
+    test.assert_eq(a.len, 32)
+    test.assert(a.more)
+    let d = coapblock.slice(100, 3, 1)
+    test.assert(d.ok)
+    test.assert_eq(d.offset, 96)
+    test.assert_eq(d.len, 4)
+    test.assert(not d.more)
+    test.case("a body that is a whole number of blocks ends full")
+    let e = coapblock.slice(96, 2, 1)
+    test.assert(e.ok)
+    test.assert_eq(e.len, 32)
+    test.assert(not e.more)
+    test.case("a block at or past the end is not valid")
+    test.assert(not coapblock.slice(100, 4, 1).ok)
+    test.assert(not coapblock.slice(96, 3, 1).ok)
+    test.case("an empty body has an empty block 0")
+    let z = coapblock.slice(0, 0, 3)
+    test.assert(z.ok)
+    test.assert_eq(z.len, 0)
+    test.assert(not z.more)
+    test.assert(not coapblock.slice(0, 1, 3).ok)
+    test.case("an invalid exponent, number or length")
+    test.assert(not coapblock.slice(100, 0, 7).ok)
+    test.assert(not coapblock.slice(100, -1, 1).ok)
+    test.assert(not coapblock.slice(-1, 0, 1).ok)
+
+@test
+fn test_a_receiver_takes_blocks_in_order() [io]
+    var rx = coapblock.blockrx(2)
+    test.assert_eq(coapblock.block_value(coapblock.blockrx_next(rx)), 2)
+    test.case("block 0, full, with more to come")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(0, true, 2), 64),
+                   coapblock.COAP_BLK_NEXT)
+    test.assert_eq(rx.offset, 64)
+    test.assert_eq(coapblock.blockrx_next(rx).num, 1)
+    test.case("block 1 again is not the next block")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(0, true, 2), 64),
+                   coapblock.COAP_BLK_REJECT)
+    test.assert_eq(rx.offset, 64)
+    test.case("a skipped block")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(2, true, 2), 64),
+                   coapblock.COAP_BLK_REJECT)
+    test.case("a block with more to come that is not full")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(1, true, 2), 63),
+                   coapblock.COAP_BLK_REJECT)
+    test.case("a block longer than its size")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(1, false, 2), 65),
+                   coapblock.COAP_BLK_REJECT)
+    test.case("a larger size than the one asked for")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(1, false, 3), 10),
+                   coapblock.COAP_BLK_REJECT)
+    test.case("a block that is not valid, and a negative length")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(1, false, 7), 10),
+                   coapblock.COAP_BLK_REJECT)
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(1, false, 2), -1),
+                   coapblock.COAP_BLK_REJECT)
+    test.case("the last block, short")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(1, false, 2), 10),
+                   coapblock.COAP_BLK_FINAL)
+    test.assert_eq(rx.offset, 74)
+    test.assert(rx.done)
+    test.case("nothing after the last")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(2, false, 2), 10),
+                   coapblock.COAP_BLK_REJECT)
+
+@test
+fn test_a_peer_may_lower_the_size_and_the_receiver_goes_on_from_the_byte() [io]
+    var rx = coapblock.blockrx(4)
+    test.case("256 asked for, 128 given")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(0, true, 3), 128),
+                   coapblock.COAP_BLK_NEXT)
+    test.assert_eq(rx.szx, 3)
+    test.assert_eq(rx.offset, 128)
+    test.assert_eq(coapblock.blockrx_next(rx).num, 1)
+    test.assert_eq(coapblock.blockrx_next(rx).szx, 3)
+    test.case("the old size is no longer accepted, and the old numbering is not either")
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(1, true, 4), 256),
+                   coapblock.COAP_BLK_REJECT)
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(2, true, 3), 128),
+                   coapblock.COAP_BLK_REJECT)
+    test.assert_eq(coapblock.blockrx_accept(var rx, coapblock.block(1, true, 3), 128),
+                   coapblock.COAP_BLK_NEXT)
+    test.assert_eq(rx.offset, 256)
+
+@test
+fn test_a_sender_goes_block_by_block() [io]
+    var tx = coapblock.blocktx(100, 1)
+    test.case("block 0 of 4, more to come")
+    let a = coapblock.blocktx_current(tx)
+    test.assert_eq(a.num, 0)
+    test.assert(a.more)
+    test.assert_eq(a.szx, 1)
+    test.case("each 2.31 Continue moves on one block")
+    test.assert_eq(coapblock.blocktx_on_response(var tx, coapwire.COAP_CONTINUE,
+                                                 coapblock.block(0, true, 1)),
+                   coapblock.COAP_BLK_NEXT)
+    test.assert_eq(tx.offset, 32)
+    test.assert_eq(coapblock.blocktx_current(tx).num, 1)
+    test.assert_eq(coapblock.blocktx_on_response(var tx, coapwire.COAP_CONTINUE,
+                                                 coapblock.block(1, true, 1)),
+                   coapblock.COAP_BLK_NEXT)
+    test.assert_eq(coapblock.blocktx_on_response(var tx, coapwire.COAP_CONTINUE,
+                                                 coapblock.block(2, true, 1)),
+                   coapblock.COAP_BLK_NEXT)
+    test.case("the last block carries no more flag, and its answer is a success")
+    let last = coapblock.blocktx_current(tx)
+    test.assert_eq(last.num, 3)
+    test.assert(not last.more)
+    test.assert_eq(coapblock.blocktx_on_response(var tx, coapwire.COAP_CHANGED,
+                                                 coapblock.block(3, false, 1)),
+                   coapblock.COAP_BLK_FINAL)
+    test.assert(tx.done)
+    test.case("nothing after the end")
+    test.assert_eq(coapblock.blocktx_on_response(var tx, coapwire.COAP_CONTINUE,
+                                                 coapblock.block(3, false, 1)),
+                   coapblock.COAP_BLK_REJECT)
+
+@test
+fn test_a_sender_edge_cases() [io]
+    test.case("a Continue for the last block ends the upload")
+    var a = coapblock.blocktx(32, 1)
+    test.assert_eq(coapblock.blocktx_on_response(var a, coapwire.COAP_CONTINUE,
+                                                 coapblock.block(0, false, 1)),
+                   coapblock.COAP_BLK_FINAL)
+    test.assert(a.done)
+    test.case("a success before the last block ends it too")
+    var b = coapblock.blocktx(100, 1)
+    test.assert_eq(coapblock.blocktx_on_response(var b, coapwire.COAP_CREATED,
+                                                 coapblock.block(0, false, 1)),
+                   coapblock.COAP_BLK_FINAL)
+    test.case("an error fails the upload, and nothing follows")
+    var c = coapblock.blocktx(100, 1)
+    test.assert_eq(coapblock.blocktx_on_response(var c, coapwire.COAP_REQUEST_ENTITY_INCOMPLETE,
+                                                 coapblock.block(0, false, 1)),
+                   coapblock.COAP_BLK_REJECT)
+    test.assert(c.failed)
+    test.assert_eq(coapblock.blocktx_on_response(var c, coapwire.COAP_CONTINUE,
+                                                 coapblock.block(0, false, 1)),
+                   coapblock.COAP_BLK_REJECT)
+    test.case("the server may lower the size, and the sender goes on from the byte")
+    var d = coapblock.blocktx(1000, 3)
+    test.assert_eq(coapblock.blocktx_on_response(var d, coapwire.COAP_CONTINUE,
+                                                 coapblock.block(0, true, 1)),
+                   coapblock.COAP_BLK_NEXT)
+    test.assert_eq(d.szx, 1)
+    test.assert_eq(d.offset, 128)
+    test.assert_eq(coapblock.blocktx_current(d).num, 4)
+    test.case("a larger size in the answer, or none, changes nothing")
+    var e = coapblock.blocktx(1000, 1)
+    test.assert_eq(coapblock.blocktx_on_response(var e, coapwire.COAP_CONTINUE,
+                                                 coapblock.block(0, true, 4)),
+                   coapblock.COAP_BLK_NEXT)
+    test.assert_eq(e.szx, 1)
+    test.assert_eq(coapblock.blocktx_on_response(var e, coapwire.COAP_CONTINUE,
+                                                 coapblock.block(1, true, 7)),
+                   coapblock.COAP_BLK_NEXT)
+    test.assert_eq(e.szx, 1)
+    test.assert_eq(e.offset, 64)

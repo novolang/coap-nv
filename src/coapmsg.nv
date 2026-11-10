@@ -1,0 +1,369 @@
+// coapmsg.nv — the message layer of CoAP, RFC 7252 section 4, with no
+// allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  CoAP runs over UDP,
+// which loses, duplicates and reorders datagrams, so the message layer
+// adds just enough to make a request and its response reliable when the
+// sender asks for it.  Everything here is arithmetic over integers the
+// caller holds; there is no socket and no clock.  The caller says how many
+// milliseconds have passed.
+//
+// THE FOUR TYPES.  A confirmable message (CON) is sent again until the
+// receiver answers it with an acknowledgement (ACK) that carries its
+// message ID, or with a reset (RST).  A non-confirmable message (NON) is
+// sent once.  An ACK either carries the response to the request it
+// acknowledges, a piggybacked response, or carries nothing, which says
+// "received, the answer comes later"; the answer then arrives as a message
+// of its own, a separate response, that may itself be CON or NON and that
+// carries the request's token.  A reset says the receiver cannot make sense
+// of the message, and it is also the answer to a ping, which is an Empty
+// confirmable message.
+//
+// THE RETRANSMISSION SCHEDULE, section 4.2.  The first wait is a number
+// between ACK_TIMEOUT (2 seconds) and ACK_TIMEOUT times ACK_RANDOM_FACTOR
+// (1.5), and it doubles after each repeat, up to MAX_RETRANSMIT (4)
+// repeats.  The random choice is the caller's: `tx_begin` takes a number
+// from 0 to 1000 and maps it onto the range, so that two devices that
+// start together do not repeat together, and so that a test can fix the
+// schedule.  The waits for a draw of 0 are 2, 4, 8, 16 and 32 seconds, and
+// the transmission has given up 62 seconds after it began.
+//
+// THE MESSAGE ID.  A client numbers its messages with a 16-bit counter that
+// starts anywhere; `next_mid` steps it.  A receiver remembers the IDs it
+// has seen for EXCHANGE_LIFETIME (247 seconds) so that a repeated message
+// is not acted on twice; `CoapDedup` is that memory, for eight IDs, and one
+// is kept for each peer.
+
+use coapwire
+
+// The first wait of a confirmable message, in milliseconds: 2000.
+pub const COAP_ACK_TIMEOUT_MS = 2000
+// The most the first wait is lengthened by chance, in milliseconds: 1000,
+// which is ACK_TIMEOUT times (ACK_RANDOM_FACTOR - 1).
+pub const COAP_ACK_RANDOM_SPREAD_MS = 1000
+// How many times a confirmable message is sent again: 4.
+pub const COAP_MAX_RETRANSMIT = 4
+// How many confirmable requests may be outstanding to one peer: 1.
+pub const COAP_NSTART = 1
+// How long a server may wait before answering a multicast request, in
+// milliseconds: 5000.
+pub const COAP_DEFAULT_LEISURE_MS = 5000
+// The time from the first transmission to the last, in milliseconds:
+// 45000.
+pub const COAP_MAX_TRANSMIT_SPAN_MS = 45000
+// The time from the first transmission to the end of the wait after the
+// last, in milliseconds: 93000.
+pub const COAP_MAX_TRANSMIT_WAIT_MS = 93000
+// How long a message ID is remembered, in milliseconds: 247000.
+pub const COAP_EXCHANGE_LIFETIME_MS = 247000
+// How long a non-confirmable message's ID is remembered, in milliseconds:
+// 145000.
+pub const COAP_NON_LIFETIME_MS = 145000
+
+// The confirmable message is waiting for its acknowledgement.
+pub const COAP_TX_WAITING = 0
+// An empty acknowledgement arrived: the response will come separately.
+pub const COAP_TX_ACKED = 1
+// The response arrived.
+pub const COAP_TX_DONE = 2
+// The peer reset the message.
+pub const COAP_TX_RESET = 3
+// Nothing arrived after the last repeat.
+pub const COAP_TX_TIMED_OUT = 4
+
+// `tx_tick`: nothing to do.
+pub const COAP_TICK_NONE = 0
+// `tx_tick`: send the same message again.
+pub const COAP_TICK_RETRANSMIT = 1
+// `tx_tick`: give up; the exchange failed.
+pub const COAP_TICK_GIVE_UP = 2
+
+// `tx_on_message`: the message is not part of this exchange.
+pub const COAP_EV_NONE = 0
+// `tx_on_message`: an empty acknowledgement; wait for the response.
+pub const COAP_EV_ACK = 1
+// `tx_on_message`: the response, piggybacked on the acknowledgement.
+pub const COAP_EV_RESPONSE = 2
+// `tx_on_message`: the response, as a message of its own. If it is
+// confirmable, acknowledge it with `build_empty_ack`.
+pub const COAP_EV_SEPARATE = 3
+// `tx_on_message`: the peer reset the message.
+pub const COAP_EV_RESET = 4
+
+// A confirmable request on its way: its ID and token, how far through the
+// schedule it is.
+pub @value
+struct CoapTx
+    // The message ID of the request.
+    mid: Int
+    // The token of the request.
+    token: CoapToken
+    // One of the `COAP_TX_` values.
+    state: Int
+    // How many times the request has been sent again.
+    retransmits: Int
+    // The wait before the next repeat, in milliseconds.
+    timeout_ms: Int
+    // How long it has waited so far, in milliseconds.
+    waited_ms: Int
+
+// What a receiver remembers of the message IDs it has seen from one peer.
+//
+// Eight slots; a ninth ID replaces the oldest.
+pub @value
+struct CoapDedup
+    // The message IDs, valid where `ages` is not negative.
+    mids: Vec[Int; 8]
+    // Milliseconds since each ID was seen, or -1 for an empty slot.
+    ages: Vec[Int; 8]
+
+// The message ID after `mid`: one more, and 0 after 65535.
+pub @tier(embedded)
+@no_alloc
+fn next_mid(mid: Int) -> Int []
+    (mid + 1) & 0xFFFF
+
+// Begin the transmission of a confirmable request.
+//
+// `mid` and `tok` are those the request carries. `rnd` is a number from 0
+// to 1000 that the caller draws, and it sets the first wait to
+// `COAP_ACK_TIMEOUT_MS` plus that fraction of `COAP_ACK_RANDOM_SPREAD_MS`;
+// a value outside the range is held to it.
+//
+// ```novo
+// use coapmsg
+// use coapwire
+//
+// fn main() [io]
+//     let t = coapmsg.tx_begin(7, coapwire.token(1, 1), 500)
+//     println("${t.timeout_ms}")   // 2500
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tx_begin(mid: Int, tok: CoapToken, rnd: Int) -> CoapTx []
+    var r = rnd
+    if r < 0
+        r = 0
+    if r > 1000
+        r = 1000
+    CoapTx { mid: mid, token: tok, state: COAP_TX_WAITING, retransmits: 0,
+             timeout_ms: COAP_ACK_TIMEOUT_MS + COAP_ACK_RANDOM_SPREAD_MS * r / 1000,
+             waited_ms: 0 }
+
+// Say that `ms` milliseconds have passed, and answer what to do.
+//
+// While the request waits for its acknowledgement and the wait is not over
+// the answer is `COAP_TICK_NONE`. When it is over, the answer is
+// `COAP_TICK_RETRANSMIT`, the wait is doubled and the clock starts again;
+// after `COAP_MAX_RETRANSMIT` repeats the next end of a wait is
+// `COAP_TICK_GIVE_UP` and the state is `COAP_TX_TIMED_OUT`. In any other
+// state there is no timer: after an empty acknowledgement the peer takes
+// as long as it needs, and how long the application waits is its own.
+//
+// ```novo
+// use coapmsg
+// use coapwire
+//
+// fn main() [io]
+//     var t = coapmsg.tx_begin(7, coapwire.token(1, 1), 0)
+//     println("${coapmsg.tx_tick(var t, 1999)} ${coapmsg.tx_tick(var t, 1)} ${t.timeout_ms}")   // 0 1 4000
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tx_tick(var t: CoapTx, ms: Int) -> Int []
+    if t.state != COAP_TX_WAITING
+        return COAP_TICK_NONE
+    t.waited_ms = t.waited_ms + ms
+    if t.waited_ms < t.timeout_ms
+        return COAP_TICK_NONE
+    if t.retransmits >= COAP_MAX_RETRANSMIT
+        t.state = COAP_TX_TIMED_OUT
+        return COAP_TICK_GIVE_UP
+    t.retransmits = t.retransmits + 1
+    t.timeout_ms = t.timeout_ms * 2
+    t.waited_ms = 0
+    COAP_TICK_RETRANSMIT
+
+// Give the exchange a message that arrived from the peer, and answer what
+// it was.
+//
+// An ACK or RST is matched by message ID, and a response by token. A
+// response is a message with a code of class 2, 4 or 5. A separate
+// response may arrive before the acknowledgement (which was lost) as well
+// as after it; either way it ends the wait.
+//
+// ```novo
+// use coapmsg
+// use coapwire
+//
+// fn main() [io]
+//     var t = coapmsg.tx_begin(7, coapwire.token(1, 1), 0)
+//     var m: coapwire.CoapMsg = Vec.new()
+//     var b = coapwire.builder()
+//     let _ = coapwire.begin(var m, var b, coapwire.COAP_TYPE_ACK, coapwire.COAP_CONTENT, 7, coapwire.token(1, 1))
+//     println("${coapmsg.tx_on_message(var t, coapwire.parse(var m))}")   // 2, a piggybacked response
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tx_on_message(var t: CoapTx, h: CoapHeader) -> Int []
+    if h.status != COAP_PARSE_OK
+        return COAP_EV_NONE
+    if t.state != COAP_TX_WAITING and t.state != COAP_TX_ACKED
+        return COAP_EV_NONE
+    if t.state == COAP_TX_WAITING and h.mid == t.mid
+        if h.kind == COAP_TYPE_RST
+            t.state = COAP_TX_RESET
+            return COAP_EV_RESET
+        if h.kind == COAP_TYPE_ACK and h.code == COAP_CODE_EMPTY
+            t.state = COAP_TX_ACKED
+            return COAP_EV_ACK
+        if h.kind == COAP_TYPE_ACK and coapwire.is_response(h.code) and coapwire.token_eq(h.token, t.token)
+            t.state = COAP_TX_DONE
+            return COAP_EV_RESPONSE
+    if (h.kind == COAP_TYPE_CON or h.kind == COAP_TYPE_NON) and coapwire.is_response(h.code)
+        if coapwire.token_eq(h.token, t.token)
+            t.state = COAP_TX_DONE
+            return COAP_EV_SEPARATE
+    COAP_EV_NONE
+
+// Whether a message is a ping: confirmable and Empty.
+//
+// The answer to a ping is a reset with its message ID.
+pub @tier(embedded)
+@no_alloc
+fn is_ping(h: CoapHeader) -> Bool []
+    h.status == COAP_PARSE_OK and h.kind == COAP_TYPE_CON and h.code == COAP_CODE_EMPTY
+
+// Build an empty acknowledgement of message `mid`, replacing what `m` held.
+//
+// It says "received", and the response follows as a message of its own.
+//
+// ```novo
+// use coapmsg
+// use coapwire
+//
+// fn main() [io]
+//     var m: coapwire.CoapMsg = Vec.new()
+//     let ok = coapmsg.build_empty_ack(var m, 0x0102)
+//     println("${ok} ${m[0]} ${m[1]} ${m[2]} ${m[3]}")   // true 96 0 1 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn build_empty_ack(var m: CoapMsg, mid: Int) -> Bool []
+    var b = coapwire.builder()
+    coapwire.begin(var m, var b, COAP_TYPE_ACK, COAP_CODE_EMPTY, mid, coapwire.token(0, 0))
+
+// Build a reset for message `mid`, replacing what `m` held.
+//
+// It is the answer to a ping, to a message that cannot be understood and to
+// a response nobody is waiting for.
+pub @tier(embedded)
+@no_alloc
+fn build_reset(var m: CoapMsg, mid: Int) -> Bool []
+    var b = coapwire.builder()
+    coapwire.begin(var m, var b, COAP_TYPE_RST, COAP_CODE_EMPTY, mid, coapwire.token(0, 0))
+
+// Build a ping: an Empty confirmable message, whose answer is a reset.
+pub @tier(embedded)
+@no_alloc
+fn build_ping(var m: CoapMsg, mid: Int) -> Bool []
+    var b = coapwire.builder()
+    coapwire.begin(var m, var b, COAP_TYPE_CON, COAP_CODE_EMPTY, mid, coapwire.token(0, 0))
+
+// Begin a response piggybacked on the acknowledgement of a request: an ACK
+// with the request's message ID and token. Options and payload follow.
+//
+// ```novo
+// use coapmsg
+// use coapwire
+//
+// fn main() [io]
+//     var req: coapwire.CoapMsg = Vec.new()
+//     var b = coapwire.builder()
+//     let _ = coapwire.begin(var req, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0x1234, coapwire.token(0x71, 1))
+//     let h = coapwire.parse(var req)
+//     var resp: coapwire.CoapMsg = Vec.new()
+//     let ok = coapmsg.build_piggyback(var resp, var b, h, coapwire.COAP_CONTENT)
+//     println("${ok} ${resp[0]} ${resp[1]} ${resp[4]}")   // true 97 69 113
+// ```
+pub @tier(embedded)
+@no_alloc
+fn build_piggyback(var m: CoapMsg, var b: CoapBuilder, req: CoapHeader, code: Int) -> Bool []
+    coapwire.begin(var m, var b, COAP_TYPE_ACK, code, req.mid, req.token)
+
+// Begin a response to a non-confirmable request: a NON with a message ID
+// of its own and the request's token.
+pub @tier(embedded)
+@no_alloc
+fn build_non_response(var m: CoapMsg, var b: CoapBuilder, req: CoapHeader, code: Int,
+                      mid: Int) -> Bool []
+    coapwire.begin(var m, var b, COAP_TYPE_NON, code, mid, req.token)
+
+// Begin a separate response: a message of its own with a message ID of its
+// own and the request's token, sent after an empty acknowledgement.
+// `confirmable` chooses CON, which the client acknowledges, or NON.
+pub @tier(embedded)
+@no_alloc
+fn build_separate(var m: CoapMsg, var b: CoapBuilder, req: CoapHeader, code: Int, mid: Int,
+                  confirmable: Bool) -> Bool []
+    var kind = COAP_TYPE_NON
+    if confirmable
+        kind = COAP_TYPE_CON
+    coapwire.begin(var m, var b, kind, code, mid, req.token)
+
+// A memory of no message IDs.
+pub @tier(embedded)
+@no_alloc
+fn dedup() -> CoapDedup []
+    var mids: Vec[Int; 8] = Vec.new()
+    var ages: Vec[Int; 8] = Vec.new()
+    for _i in 0..8
+        let _a = mids.push(0)
+        let _b = ages.push(-1)
+    CoapDedup { mids: mids, ages: ages }
+
+// Whether `mid` was seen within the exchange lifetime, and remember it.
+//
+// Answers true for a message ID that is already held, which means the
+// message is a repeat and must not be acted on again: the server answers it
+// with the response it gave the first time. Answers false for a new one,
+// and holds it, in an empty slot or in place of the oldest.
+//
+// ```novo
+// use coapmsg
+//
+// fn main() [io]
+//     var d = coapmsg.dedup()
+//     println("${coapmsg.dedup_seen(var d, 9)} ${coapmsg.dedup_seen(var d, 9)}")   // false true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn dedup_seen(var d: CoapDedup, mid: Int) -> Bool []
+    for i in 0..8
+        if d.ages[i] >= 0 and d.mids[i] == mid
+            return true
+    var slot = 0
+    var best = -2
+    for i in 0..8
+        var score = d.ages[i]
+        if score < 0
+            score = 1000000000000
+        if score > best
+            best = score
+            slot = i
+    d.mids[slot] = mid
+    d.ages[slot] = 0
+    false
+
+// Say that `ms` milliseconds have passed, and forget the IDs that are
+// older than the exchange lifetime.
+pub @tier(embedded)
+@no_alloc
+fn dedup_age(var d: CoapDedup, ms: Int) []
+    for i in 0..8
+        if d.ages[i] >= 0
+            let a = d.ages[i] + ms
+            if a >= COAP_EXCHANGE_LIFETIME_MS
+                d.ages[i] = -1
+            else
+                d.ages[i] = a

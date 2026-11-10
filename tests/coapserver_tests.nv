@@ -1,0 +1,452 @@
+// coapserver_tests.nv — a server over a table of resources.
+//
+// The expected datagrams are derived by hand from the layout of RFC 7252
+// section 3 and the rules of section 4 and 5.  A confirmable request with a
+// token of one byte, 0x71, and message ID 0x1234 starts 41 01 12 34 71.  The
+// piggybacked response is an ACK with the same ID and token: 61, then the
+// code, 12 34 71.  A non-confirmable response is 51 with an ID of the
+// server's, 0x00AA here.  An Empty ACK is 60 00 and the ID, a reset 70 00
+// and the ID.  Content-Format is option 12 and its value 0 has no bytes, so
+// the option is one byte, delta 12 and length 0: C0.
+
+use std.test
+use coapblock
+use coapmsg
+use coapobs
+use coapserver
+use coapwire
+
+struct Table
+    unused: Int
+
+impl CoapResources[] for Table
+    fn res_count(self) -> Int
+        6
+
+    fn res_path(self, i: Int) -> Str
+        match i
+            0 => "sensors/temp"
+            1 => "config"
+            2 => "slow"
+            3 => "broken"
+            4 => "failing"
+            _ => "echo"
+
+    fn res_methods(self, i: Int) -> Int
+        match i
+            1 => 5
+            5 => 15
+            _ => 1
+
+    fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader, var resp: CoapMsg,
+                  var b: CoapBuilder) -> Int
+        if i == 0
+            let _ = coapwire.add_uint(var resp, var b, coapwire.COAP_OPT_CONTENT_FORMAT, 0)
+            let _ = coapwire.start_payload(var resp, var b)
+            let _ = coapwire.push_payload_str(var resp, var b, "21.5")
+            return coapwire.COAP_CONTENT
+        if i == 1
+            if method == coapwire.COAP_PUT
+                return coapwire.COAP_CHANGED
+            return coapwire.COAP_CONTENT
+        if i == 2
+            return coapserver.COAP_DEFER
+        if i == 3
+            return 0x20
+        if i == 4
+            let _ = coapwire.add_uint(var resp, var b, 12, 0)
+            let _ = coapwire.add_uint(var resp, var b, 11, 0)
+            return coapwire.COAP_CONTENT
+        if method == coapwire.COAP_DELETE
+            return coapwire.COAP_DELETED
+        let _ = coapwire.start_payload(var resp, var b)
+        for k in 0..coapwire.payload_len(h)
+            let _ = coapwire.push_payload(var resp, var b, coapwire.payload_byte(var req, h, k))
+        if method == coapwire.COAP_GET
+            return coapwire.COAP_CONTENT
+        coapwire.COAP_CHANGED
+
+// A request of a type and a method for a path, with ID 0x1234 and token 0x71.
+fn request(kind: Int, code: Int, path: Str) -> coapwire.CoapMsg
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    let _ = coapwire.begin(var m, var b, kind, code, 0x1234, coapwire.token(0x71, 1))
+    let _ = coapwire.add_path(var m, var b, path)
+    m
+
+// The index of the first byte of the message that differs from the
+// expected list, -2 when the lengths differ, and -1 when they agree.
+fn diff(var m: coapwire.CoapMsg, want: [Int]) -> Int
+    if m.len() != list.len(want)
+        return -2
+    for i in 0..m.len()
+        if (m[i] as Int) != want[i]
+            return i
+    -1
+
+// A message from a list of byte values.
+fn msg_of(xs: [Int]) -> coapwire.CoapMsg
+    var m: coapwire.CoapMsg = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+@test
+fn test_a_confirmable_get_is_answered_in_the_ack() [io]
+    var req = request(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, "sensors/temp")
+    var resp: coapwire.CoapMsg = Vec.new()
+    var d = coapmsg.dedup()
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var req, var resp, var d, 0xAA),
+                   coapserver.COAP_SERVE_REPLY)
+    // 61 45 12 34 71, the option C0, the marker FF and "21.5" 32 31 2E 35.
+    test.assert_eq(diff(var resp, [0x61, 0x45, 0x12, 0x34, 0x71, 0xC0, 0xFF, 0x32, 0x31, 0x2E,
+                                   0x35]),
+                                   -1)
+
+@test
+fn test_a_non_confirmable_get_gets_a_non_confirmable_response() [io]
+    var req = request(coapwire.COAP_TYPE_NON, coapwire.COAP_GET, "sensors/temp")
+    var resp: coapwire.CoapMsg = Vec.new()
+    var d = coapmsg.dedup()
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var req, var resp, var d, 0xAA),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x51, 0x45, 0x00, 0xAA, 0x71, 0xC0, 0xFF, 0x32, 0x31, 0x2E,
+                                   0x35]),
+                                   -1)
+
+@test
+fn test_a_path_that_nothing_has_is_not_found() [io]
+    var d = coapmsg.dedup()
+    var resp: coapwire.CoapMsg = Vec.new()
+    var con = request(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, "nothing")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var con, var resp, var d, 0xAA),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x61, 0x84, 0x12, 0x34, 0x71]), -1)
+    var non = request(coapwire.COAP_TYPE_NON, coapwire.COAP_GET, "nothing")
+    var d2 = coapmsg.dedup()
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var non, var resp, var d2, 0xAA),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x51, 0x84, 0x00, 0xAA, 0x71]), -1)
+
+@test
+fn test_a_method_the_resource_does_not_allow() [io]
+    var d = coapmsg.dedup()
+    var resp: coapwire.CoapMsg = Vec.new()
+    var post = request(coapwire.COAP_TYPE_CON, coapwire.COAP_POST, "sensors/temp")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var post, var resp, var d, 0xAA),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x61, 0x85, 0x12, 0x34, 0x71]), -1)
+    test.case("a code that is no method at all")
+    var odd = request(coapwire.COAP_TYPE_CON, 0x05, "sensors/temp")
+    var d2 = coapmsg.dedup()
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var odd, var resp, var d2, 0xAA),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x61, 0x85, 0x12, 0x34, 0x71]), -1)
+
+@test
+fn test_each_method_reaches_its_handler() [io]
+    var resp: coapwire.CoapMsg = Vec.new()
+    test.case("PUT to a resource that allows GET and PUT")
+    var d = coapmsg.dedup()
+    var put = request(coapwire.COAP_TYPE_CON, coapwire.COAP_PUT, "config")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var put, var resp, var d, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(resp[1] as Int, 0x44)
+    test.case("GET to it")
+    var d2 = coapmsg.dedup()
+    var get = request(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, "config")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var get, var resp, var d2, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(resp[1] as Int, 0x45)
+    test.case("DELETE to it is not allowed")
+    var d3 = coapmsg.dedup()
+    var del = request(coapwire.COAP_TYPE_CON, coapwire.COAP_DELETE, "config")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var del, var resp, var d3, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(resp[1] as Int, 0x85)
+    test.case("the echo resource allows all four")
+    var d4 = coapmsg.dedup()
+    var del2 = request(coapwire.COAP_TYPE_CON, coapwire.COAP_DELETE, "echo")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var del2, var resp, var d4, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(resp[1] as Int, 0x42)
+    var d5 = coapmsg.dedup()
+    var postreq = request(coapwire.COAP_TYPE_CON, coapwire.COAP_POST, "echo")
+    var bb = coapwire.builder()
+    test.assert(coapwire.start_payload(var postreq, var bb))
+    test.assert(coapwire.push_payload_str(var postreq, var bb, "hi"))
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var postreq, var resp, var d5, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    // 61 44 12 34 71 FF 'h' 'i'
+    test.assert_eq(diff(var resp, [0x61, 0x44, 0x12, 0x34, 0x71, 0xFF, 0x68, 0x69]), -1)
+    test.assert_eq(coapserver.method_bit(coapwire.COAP_GET), coapserver.COAP_M_GET)
+    test.assert_eq(coapserver.method_bit(coapwire.COAP_POST), coapserver.COAP_M_POST)
+    test.assert_eq(coapserver.method_bit(coapwire.COAP_PUT), coapserver.COAP_M_PUT)
+    test.assert_eq(coapserver.method_bit(coapwire.COAP_DELETE), coapserver.COAP_M_DELETE)
+    test.assert_eq(coapserver.method_bit(0x45), 0)
+
+@test
+fn test_a_handler_that_will_answer_later_gets_an_empty_ack() [io]
+    var resp: coapwire.CoapMsg = Vec.new()
+    var d = coapmsg.dedup()
+    var con = request(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, "slow")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var con, var resp, var d, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x60, 0x00, 0x12, 0x34]), -1)
+    test.case("and a non-confirmable request gets nothing")
+    var d2 = coapmsg.dedup()
+    var non = request(coapwire.COAP_TYPE_NON, coapwire.COAP_GET, "slow")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var non, var resp, var d2, 1),
+                   coapserver.COAP_SERVE_NONE)
+    test.assert_eq(resp.len(), 0)
+
+@test
+fn test_a_handler_that_fails_is_a_server_error() [io]
+    var resp: coapwire.CoapMsg = Vec.new()
+    test.case("a code that is no response code")
+    var d = coapmsg.dedup()
+    var a = request(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, "broken")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var a, var resp, var d, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x61, 0xA0, 0x12, 0x34, 0x71]), -1)
+    test.case("a builder left failed by an option out of order")
+    var d2 = coapmsg.dedup()
+    var b = request(coapwire.COAP_TYPE_NON, coapwire.COAP_GET, "failing")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var b, var resp, var d2, 0xAA),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x51, 0xA0, 0x00, 0xAA, 0x71]), -1)
+
+@test
+fn test_a_repeated_request_is_not_run_again() [io]
+    var resp: coapwire.CoapMsg = Vec.new()
+    var d = coapmsg.dedup()
+    var req = request(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, "sensors/temp")
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var req, var resp, var d, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var req, var resp, var d, 1),
+                   coapserver.COAP_SERVE_DUPLICATE)
+    test.assert_eq(resp.len(), 0)
+    test.case("after the exchange lifetime it is a new request")
+    coapmsg.dedup_age(var d, 247000)
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var req, var resp, var d, 1),
+                   coapserver.COAP_SERVE_REPLY)
+
+@test
+fn test_pings_resets_and_messages_that_are_not_requests() [io]
+    var resp: coapwire.CoapMsg = Vec.new()
+    var d = coapmsg.dedup()
+    test.case("a ping is answered with a reset")
+    var ping = msg_of([0x40, 0x00, 0xBE, 0xEF])
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var ping, var resp, var d, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x70, 0x00, 0xBE, 0xEF]), -1)
+    test.case("an ACK or a reset is dropped")
+    var ack = msg_of([0x60, 0x00, 0x00, 0x01])
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var ack, var resp, var d, 1),
+                   coapserver.COAP_SERVE_NONE)
+    test.assert_eq(resp.len(), 0)
+    var rst = msg_of([0x70, 0x00, 0x00, 0x01])
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var rst, var resp, var d, 1),
+                   coapserver.COAP_SERVE_NONE)
+    test.case("a confirmable response is reset, a non-confirmable one dropped")
+    var con = msg_of([0x40, 0x45, 0x00, 0x02])
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var con, var resp, var d, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x70, 0x00, 0x00, 0x02]), -1)
+    var non = msg_of([0x50, 0x45, 0x00, 0x03])
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var non, var resp, var d, 1),
+                   coapserver.COAP_SERVE_NONE)
+
+@test
+fn test_a_message_that_cannot_be_read() [io]
+    var resp: coapwire.CoapMsg = Vec.new()
+    var d = coapmsg.dedup()
+    test.case("a confirmable one with a bad option is reset")
+    var bad = msg_of([0x40, 0x01, 0x12, 0x34, 0xF1, 0x00])
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var bad, var resp, var d, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x70, 0x00, 0x12, 0x34]), -1)
+    test.case("a non-confirmable one is dropped")
+    var non = msg_of([0x50, 0x01, 0x12, 0x34, 0xF1, 0x00])
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var non, var resp, var d, 1),
+                   coapserver.COAP_SERVE_NONE)
+    test.case("a version that is not 1, or a message too short for an ID, is dropped")
+    var v2 = msg_of([0x80, 0x01, 0x12, 0x34])
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var v2, var resp, var d, 1),
+                   coapserver.COAP_SERVE_NONE)
+    var short = msg_of([0x40, 0x01, 0x12])
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var short, var resp, var d, 1),
+                   coapserver.COAP_SERVE_NONE)
+
+@test
+fn test_a_critical_option_the_server_does_not_know() [io]
+    var resp: coapwire.CoapMsg = Vec.new()
+    var con = request(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, "sensors/temp")
+    var b = coapwire.builder()
+    // Proxy-Uri (35) is critical and not understood, and 35 > 11 keeps the
+    // options in order.
+    test.assert(coapwire.begin(var con, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0x1234,
+                               coapwire.token(0x71, 1)))
+    test.assert(coapwire.add_path(var con, var b, "sensors/temp"))
+    test.assert(coapwire.add_str(var con, var b, coapwire.COAP_OPT_PROXY_URI, "coap://x"))
+    var d = coapmsg.dedup()
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var con, var resp, var d, 1),
+                   coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x61, 0x82, 0x12, 0x34, 0x71]), -1)
+    test.case("a non-confirmable request with one is dropped")
+    var non = request(coapwire.COAP_TYPE_NON, coapwire.COAP_GET, "sensors/temp")
+    test.assert(coapwire.begin(var non, var b, coapwire.COAP_TYPE_NON, coapwire.COAP_GET, 0x1235,
+                               coapwire.token(0x71, 1)))
+    test.assert(coapwire.add_path(var non, var b, "sensors/temp"))
+    test.assert(coapwire.add_str(var non, var b, coapwire.COAP_OPT_PROXY_URI, "coap://x"))
+    test.assert_eq(coapserver.serve(Table { unused: 0 }, var non, var resp, var d, 1),
+                   coapserver.COAP_SERVE_NONE)
+
+@test
+fn test_the_empty_table() [io]
+    let t = coapserver.CoapNoResources { unused: 0 }
+    test.assert_eq(t.res_count(), 0)
+    test.assert_eq(t.res_path(0), "")
+    test.assert_eq(t.res_methods(0), 0)
+    var req = request(coapwire.COAP_TYPE_CON, coapwire.COAP_GET, "x")
+    var resp: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.assert_eq(t.res_handle(0, coapwire.COAP_GET, var req, coapwire.parse(var req), var resp,
+                                var b),
+                                coapwire.COAP_NOT_IMPLEMENTED)
+    var d = coapmsg.dedup()
+    test.assert_eq(coapserver.serve(t, var req, var resp, var d, 1), coapserver.COAP_SERVE_REPLY)
+    test.assert_eq(diff(var resp, [0x61, 0x84, 0x12, 0x34, 0x71]), -1)
+    test.assert_eq(coapserver.find_resource(t, var req, coapwire.parse(var req)), -1)
+
+@test
+fn test_a_client_downloads_a_resource_in_blocks() [io]
+    // A resource of 150 bytes served in blocks of 64: the client asks with
+    // Block2 for block 0, 1, 2 and each answer carries the block and the
+    // flag.  The loop is the whole of block-wise GET, with the server
+    // working from `coapblock.slice`.
+    var rx = coapblock.blockrx(2)
+    var got = 0
+    var rounds = 0
+    for _i in 0..10
+        if not rx.done
+            rounds = rounds + 1
+            var req: coapwire.CoapMsg = Vec.new()
+            var b = coapwire.builder()
+            test.assert(coapwire.begin(var req, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET,
+                                       rounds, coapwire.token(0x71, 1)))
+            test.assert(coapblock.add_block(var req, var b, coapwire.COAP_OPT_BLOCK2,
+                                            coapblock.blockrx_next(rx)))
+            // The server reads the request's block and answers from the slice.
+            let rh = coapwire.parse(var req)
+            let want = coapblock.read_block(var req, rh, coapwire.COAP_OPT_BLOCK2)
+            let s = coapblock.slice(150, want.num, want.szx)
+            test.assert(s.ok)
+            var resp: coapwire.CoapMsg = Vec.new()
+            var rb = coapwire.builder()
+            test.assert(coapmsg.build_piggyback(var resp, var rb, rh, coapwire.COAP_CONTENT))
+            test.assert(coapblock.add_block(var resp, var rb, coapwire.COAP_OPT_BLOCK2,
+                                            coapblock.block(want.num, s.more, want.szx)))
+            test.assert(coapwire.start_payload(var resp, var rb))
+            for k in 0..s.len
+                test.assert(coapwire.push_payload(var resp, var rb, (s.offset + k) & 255))
+            // The client reads the answer.
+            let h = coapwire.parse(var resp)
+            let blk = coapblock.read_block(var resp, h, coapwire.COAP_OPT_BLOCK2)
+            let r = coapblock.blockrx_accept(var rx, blk, coapwire.payload_len(h))
+            test.assert(r != coapblock.COAP_BLK_REJECT)
+            got = got + coapwire.payload_len(h)
+    test.assert_eq(rounds, 3)
+    test.assert_eq(got, 150)
+    test.assert(rx.done)
+
+@test
+fn test_a_client_uploads_a_body_in_blocks_to_a_server_that_reassembles_it() [io]
+    // A body of 100 bytes sent in blocks of 32 with Block1.  The server
+    // takes each into a receiver and answers 2.31 Continue, and 2.04 for
+    // the last.
+    var tx = coapblock.blocktx(100, 1)
+    var rx = coapblock.blockrx(1)
+    var sent = 0
+    var taken = 0
+    for _i in 0..10
+        if not tx.done
+            let cur = coapblock.blocktx_current(tx)
+            let s = coapblock.slice(100, cur.num, cur.szx)
+            test.assert(s.ok)
+            var req: coapwire.CoapMsg = Vec.new()
+            var b = coapwire.builder()
+            test.assert(coapwire.begin(var req, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_PUT,
+                                       sent + 1, coapwire.token(0x71, 1)))
+            test.assert(coapblock.add_block(var req, var b, coapwire.COAP_OPT_BLOCK1, cur))
+            test.assert(coapwire.start_payload(var req, var b))
+            for k in 0..s.len
+                test.assert(coapwire.push_payload(var req, var b, k))
+            sent = sent + 1
+            // The server.
+            let h = coapwire.parse(var req)
+            let blk = coapblock.read_block(var req, h, coapwire.COAP_OPT_BLOCK1)
+            let verdict = coapblock.blockrx_accept(var rx, blk, coapwire.payload_len(h))
+            test.assert(verdict != coapblock.COAP_BLK_REJECT)
+            taken = taken + coapwire.payload_len(h)
+            var code = coapwire.COAP_CONTINUE
+            if verdict == coapblock.COAP_BLK_FINAL
+                code = coapwire.COAP_CHANGED
+            // The client.
+            let r = coapblock.blocktx_on_response(var tx, code, blk)
+            test.assert(r != coapblock.COAP_BLK_REJECT)
+    test.assert_eq(sent, 4)
+    test.assert_eq(taken, 100)
+    test.assert(tx.done)
+    test.assert(rx.done)
+
+@test
+fn test_an_observer_is_notified_with_the_registration_token() [io]
+    // A client registers with GET and Observe 0; the server records the
+    // observer.  The resource changes twice; each notification is a
+    // response with the token of the registration and the next sequence
+    // number: Observe is option 6, so a value of one byte is 61 and the
+    // byte.
+    var obs = coapobs.observers()
+    var req: coapwire.CoapMsg = Vec.new()
+    var rb = coapwire.builder()
+    test.assert(coapwire.begin(var req, var rb, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0x1234,
+                               coapwire.token(0x71, 1)))
+    test.assert(coapwire.add_uint(var req, var rb, coapwire.COAP_OPT_OBSERVE, 0))
+    test.assert(coapwire.add_path(var req, var rb, "sensors/temp"))
+    let h = coapwire.parse(var req)
+    test.assert_eq(coapobs.request_observe(var req, h), coapobs.COAP_OBSERVE_REGISTER)
+    test.assert_eq(coapobs.obs_register(var obs, 0, 7, h.token), coapobs.COAP_OBS_ADDED)
+
+    var last_seq = 0
+    for round in 0..2
+        let seq = coapobs.obs_next_seq(var obs, 0)
+        let slot = coapobs.obs_find(var obs, 0, 0)
+        test.assert_eq(coapobs.obs_peer(var obs, slot), 7)
+        var n: coapwire.CoapMsg = Vec.new()
+        var nb = coapwire.builder()
+        let mid = 0x0100 + round
+        test.assert(coapmsg.build_separate(var n, var nb, h, coapwire.COAP_CONTENT, mid, false))
+        test.assert(coapwire.add_uint(var n, var nb, coapwire.COAP_OPT_OBSERVE, seq))
+        test.assert(coapwire.start_payload(var n, var nb))
+        test.assert(coapwire.push_payload_str(var n, var nb, "21.5"))
+        coapobs.obs_note_mid(var obs, slot, mid)
+        if round == 0
+            test.assert_eq(diff(var n, [0x51, 0x45, 0x01, 0x00, 0x71, 0x61, 0x01, 0xFF, 0x32, 0x31,
+                                        0x2E, 0x35]),
+                                        -1)
+        else
+            test.assert_eq(diff(var n, [0x51, 0x45, 0x01, 0x01, 0x71, 0x61, 0x02, 0xFF, 0x32, 0x31,
+                                        0x2E, 0x35]),
+                                        -1)
+        // The client takes it only if it is newer than the last.
+        let nh = coapwire.parse(var n)
+        test.assert(coapwire.token_eq(nh.token, h.token))
+        let got = coapwire.find_uint(var n, nh, coapwire.COAP_OPT_OBSERVE)
+        test.assert(coapobs.observe_newer(last_seq, got, 0))
+        last_seq = got
+    test.assert_eq(last_seq, 2)
+
+    test.case("a reset of the last notification removes the observer")
+    test.assert(coapobs.obs_reset(var obs, 7, 0x0101))
+    test.assert_eq(coapobs.obs_count(var obs, 0), 0)

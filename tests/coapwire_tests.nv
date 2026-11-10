@@ -1,0 +1,552 @@
+// coapwire_tests.nv — the CoAP message, byte by byte.
+//
+// THE VECTORS ARE DERIVED BY HAND from section 3 of RFC 7252, not recorded
+// from this code.  The first two are the request and the response of the
+// RFC's own example in section 4.8, "GET /temperature" answered with
+// "22.3 C": the request is a confirmable GET with message ID 0x7D34 and
+// the option Uri-Path "temperature", and the response is a piggybacked
+// 2.05 Content that carries the same message ID.  Each other vector is
+// worked out in the comment above it.  ASCII used throughout: 'a' 0x61,
+// 'x' 0x78, '=' 0x3D, '1' 0x31.
+
+use std.str
+use std.test
+use coapwire
+
+// A message from a list of byte values.
+fn msg_of(xs: [Int]) -> coapwire.CoapMsg
+    var m: coapwire.CoapMsg = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+// A message of `n` bytes, to leave a chosen room.
+fn filled(n: Int) -> coapwire.CoapMsg
+    var m: coapwire.CoapMsg = Vec.new()
+    for _i in 0..n
+        let _ = m.push(0 as u8)
+    m
+
+// The index of the first byte of the message that differs from the
+// expected list, -2 when the lengths differ, and -1 when they agree.
+fn diff(var m: coapwire.CoapMsg, want: [Int]) -> Int
+    if m.len() != list.len(want)
+        return -2
+    for i in 0..m.len()
+        if (m[i] as Int) != want[i]
+            return i
+    -1
+
+// A confirmable GET with a given token and no options.
+fn get(var m: coapwire.CoapMsg, var b: coapwire.CoapBuilder, tok: coapwire.CoapToken) -> Bool
+    coapwire.begin(var m, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0, tok)
+
+@test
+fn test_the_rfc_example_request_and_response() [io]
+    // 0x40 is version 1 (01), type CON (00), token length 0 (0000).  The
+    // code is 0.01.  The ID is 7D 34.  The option has number 11 and
+    // length 11, so one byte holds delta 11 and length 11: 0xBB.  The
+    // value is the eleven letters of "temperature".
+    test.case("the request is 16 bytes")
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.assert(coapwire.begin(var m, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET,
+                               0x7D34, coapwire.token(0, 0)))
+    test.assert(coapwire.add_path(var m, var b, "/temperature"))
+    test.assert_eq(diff(var m, [0x40, 0x01, 0x7D, 0x34, 0xBB, 0x74, 0x65, 0x6D, 0x70, 0x65,
+                                0x72, 0x61, 0x74, 0x75, 0x72, 0x65]),
+                                -1)
+
+    test.case("the request parses to what was built")
+    let h = coapwire.parse(var m)
+    test.assert(coapwire.header_ok(h))
+    test.assert_eq(h.kind, coapwire.COAP_TYPE_CON)
+    test.assert_eq(h.code, coapwire.COAP_GET)
+    test.assert_eq(h.mid, 0x7D34)
+    test.assert_eq(h.token.len, 0)
+    test.assert_eq(h.options_off, 4)
+    test.assert_eq(h.payload_off, 16)
+    test.assert_eq(h.len, 16)
+    test.assert_eq(coapwire.payload_len(h), 0)
+    test.assert(coapwire.path_is(var m, h, "temperature"))
+
+    // 0x60 is version 1, type ACK (10), token length 0.  The code is
+    // 2.05, which is (2 << 5) | 5 = 0x45.  Then the marker 0xFF and the
+    // six bytes of "22.3 C": 32 32 2E 33 20 43.
+    test.case("the response is a piggybacked 2.05 with the same ID")
+    var r: coapwire.CoapMsg = Vec.new()
+    var rb = coapwire.builder()
+    test.assert(coapwire.begin(var r, var rb, coapwire.COAP_TYPE_ACK, coapwire.COAP_CONTENT,
+                               0x7D34, coapwire.token(0, 0)))
+    test.assert(coapwire.start_payload(var r, var rb))
+    test.assert(coapwire.push_payload_str(var r, var rb, "22.3 C"))
+    test.assert_eq(diff(var r, [0x60, 0x45, 0x7D, 0x34, 0xFF, 0x32, 0x32, 0x2E, 0x33, 0x20,
+                                0x43]),
+                                -1)
+    let rh = coapwire.parse(var r)
+    test.assert(coapwire.header_ok(rh))
+    test.assert_eq(rh.kind, coapwire.COAP_TYPE_ACK)
+    test.assert_eq(rh.code, 0x45)
+    test.assert_eq(coapwire.payload_len(rh), 6)
+    test.assert_eq(rh.payload_off, 5)
+    test.assert_eq(coapwire.payload_byte(var r, rh, 0), 0x32)
+    test.assert_eq(coapwire.payload_byte(var r, rh, 5), 0x43)
+    test.assert_eq(coapwire.payload_byte(var r, rh, 6), -1)
+    test.assert_eq(coapwire.payload_byte(var r, rh, -1), -1)
+
+@test
+fn test_a_message_with_a_token_and_three_options() [io]
+    // 0x51 is version 1, type NON (01), token length 1.  Code 0.01, ID
+    // 12 34, token 71.  Options in order of number: Uri-Path (11) "a" is
+    // delta 11, length 1: B1 61.  Content-Format (12) with the value 60
+    // is delta 1, length 1: 11 3C.  Uri-Query (15) "x=1" is delta 3,
+    // length 3: 33 78 3D 31.
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.assert(coapwire.begin(var m, var b, coapwire.COAP_TYPE_NON, coapwire.COAP_GET, 0x1234,
+                               coapwire.token(0x71, 1)))
+    test.assert(coapwire.add_path(var m, var b, "a"))
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_CONTENT_FORMAT, 60))
+    test.assert(coapwire.add_query(var m, var b, "x=1"))
+    test.assert_eq(diff(var m, [0x51, 0x01, 0x12, 0x34, 0x71, 0xB1, 0x61, 0x11, 0x3C, 0x33, 0x78,
+                                0x3D, 0x31]),
+                                -1)
+    let h = coapwire.parse(var m)
+    test.assert(coapwire.header_ok(h))
+    test.assert_eq(h.token.len, 1)
+    test.assert_eq(h.token.value, 0x71)
+    test.assert_eq(coapwire.find_uint(var m, h, coapwire.COAP_OPT_CONTENT_FORMAT), 60)
+    test.assert_eq(coapwire.find_uint(var m, h, coapwire.COAP_OPT_MAX_AGE), -1)
+    test.assert(coapwire.has_option(var m, h, coapwire.COAP_OPT_URI_QUERY))
+    test.assert(not coapwire.has_option(var m, h, coapwire.COAP_OPT_ETAG))
+    test.assert_eq(coapwire.count_options(var m, h, coapwire.COAP_OPT_URI_PATH), 1)
+    test.assert(coapwire.path_is(var m, h, "a"))
+    test.assert(coapwire.query_has(var m, h, "x=1"))
+    test.assert(not coapwire.query_has(var m, h, "x=2"))
+    test.assert(not coapwire.query_has(var m, h, "x="))
+
+@test
+fn test_option_numbers_and_lengths_past_twelve() [io]
+    // Option 60 is 47 more than 13: delta nibble 13 and one byte 47 =
+    // 0x2F.  With length 1 and the value 5 the option is D1 2F 05.
+    // Option 300 follows, 240 on: nibble 13 and the byte 240 - 13 = 227 =
+    // 0xE3; length 0: D0 E3.  Option 600 is 300 on, which is over 269:
+    // nibble 14 and two bytes 300 - 269 = 31, so 00 1F; length 0: E0 00 1F.
+    test.case("deltas of 13 and 269 or more")
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_SIZE1, 5))
+    test.assert(coapwire.add_empty(var m, var b, 300))
+    test.assert(coapwire.add_empty(var m, var b, 600))
+    test.assert_eq(diff(var m, [0x40, 0x01, 0x00, 0x00, 0xD1, 0x2F, 0x05, 0xD0, 0xE3, 0xE0,
+                                0x00, 0x1F]),
+                                -1)
+    let h = coapwire.parse(var m)
+    test.assert(coapwire.header_ok(h))
+    var it = coapwire.opt_iter(h)
+    test.assert(coapwire.opt_next(var m, var it))
+    test.assert_eq(it.number, 60)
+    test.assert_eq(it.value_len, 1)
+    test.assert_eq(coapwire.opt_uint(var m, it), 5)
+    test.assert(coapwire.opt_next(var m, var it))
+    test.assert_eq(it.number, 300)
+    test.assert_eq(it.value_len, 0)
+    test.assert(coapwire.opt_next(var m, var it))
+    test.assert_eq(it.number, 600)
+    test.assert(not coapwire.opt_next(var m, var it))
+
+    // A string of 13 bytes is length nibble 13 and the byte 0; one of 269
+    // is nibble 14 and 00 00; one of 300 is nibble 14 and 00 1F (31).
+    test.case("lengths of 13, 269 and 300")
+    let s13 = str.repeat("x", 13)
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_str(var m, var b, coapwire.COAP_OPT_URI_PATH, s13))
+    test.assert_eq(m[4] as Int, 0xBD)
+    test.assert_eq(m[5] as Int, 0x00)
+    test.assert_eq(m.len(), 4 + 2 + 13)
+    test.assert(coapwire.path_is(var m, coapwire.parse(var m), s13))
+    let s269 = str.repeat("y", 269)
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_str(var m, var b, coapwire.COAP_OPT_URI_PATH, s269))
+    test.assert_eq(m[4] as Int, 0xBE)
+    test.assert_eq(m[5] as Int, 0x00)
+    test.assert_eq(m[6] as Int, 0x00)
+    test.assert(coapwire.path_is(var m, coapwire.parse(var m), s269))
+    let s300 = str.repeat("z", 300)
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_str(var m, var b, coapwire.COAP_OPT_URI_PATH, s300))
+    test.assert_eq(m[5] as Int, 0x00)
+    test.assert_eq(m[6] as Int, 0x1F)
+    let hh = coapwire.parse(var m)
+    test.assert(coapwire.header_ok(hh))
+    test.assert_eq(m.len(), 4 + 3 + 300)
+
+@test
+fn test_an_integer_option_is_the_fewest_bytes() [io]
+    // Content-Format (12) after delta 12 is C0 plus the length nibble.
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.case("0 has no bytes")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var b, 12, 0))
+    test.assert_eq(diff(var m, [0x40, 0x01, 0x00, 0x00, 0xC0]), -1)
+    test.assert_eq(coapwire.find_uint(var m, coapwire.parse(var m), 12), 0)
+    test.case("255 has one, 256 two, 65536 three")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var b, 12, 255))
+    test.assert_eq(diff(var m, [0x40, 0x01, 0x00, 0x00, 0xC1, 0xFF]), -1)
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var b, 12, 256))
+    test.assert_eq(diff(var m, [0x40, 0x01, 0x00, 0x00, 0xC2, 0x01, 0x00]), -1)
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var b, 12, 65536))
+    test.assert_eq(diff(var m, [0x40, 0x01, 0x00, 0x00, 0xC3, 0x01, 0x00, 0x00]), -1)
+    test.case("2^32 has five, and the largest Int has eight")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var b, 12, 4294967296))
+    test.assert_eq(diff(var m, [0x40, 0x01, 0x00, 0x00, 0xC5, 0x01, 0x00, 0x00, 0x00, 0x00]), -1)
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var b, 12, 9223372036854775807))
+    test.assert_eq(m.len(), 4 + 1 + 8)
+    test.assert_eq(m[5] as Int, 0x7F)
+    test.assert_eq(coapwire.find_uint(var m, coapwire.parse(var m), 12), 9223372036854775807)
+    test.case("an option longer than eight bytes has no integer value")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_str(var m, var b, 12, "123456789"))
+    test.assert_eq(coapwire.find_uint(var m, coapwire.parse(var m), 12), -1)
+    test.case("a negative value is refused and empties the message")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(not coapwire.add_uint(var m, var b, 12, -1))
+    test.assert_eq(m.len(), 0)
+    test.assert(not b.ok)
+
+@test
+fn test_opaque_options_and_empty_options() [io]
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    // ETag (4) with two bytes 01 02: delta 4, length 2: 42 01 02.
+    // If-None-Match (5) with no value: delta 1, length 0: 10.
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_opaque(var m, var b, coapwire.COAP_OPT_ETAG, 0x0102, 2))
+    test.assert(coapwire.add_empty(var m, var b, coapwire.COAP_OPT_IF_NONE_MATCH))
+    test.assert_eq(diff(var m, [0x40, 0x01, 0x00, 0x00, 0x42, 0x01, 0x02, 0x10]), -1)
+    test.case("eight bytes with the high bit set")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_opaque(var m, var b, coapwire.COAP_OPT_ETAG, -1, 8))
+    test.assert_eq(m.len(), 4 + 1 + 8)
+    test.assert_eq(m[5] as Int, 0xFF)
+    test.assert_eq(coapwire.find_uint(var m, coapwire.parse(var m), 4), -1)
+    test.case("a length of 9 or -1 is refused")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(not coapwire.add_opaque(var m, var b, coapwire.COAP_OPT_ETAG, 1, 9))
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(not coapwire.add_opaque(var m, var b, coapwire.COAP_OPT_ETAG, 1, -1))
+    test.assert_eq(m.len(), 0)
+
+@test
+fn test_tokens() [io]
+    test.case("a token is cut to its length")
+    let t = coapwire.token(0x1234, 1)
+    test.assert_eq(t.len, 1)
+    test.assert_eq(t.value, 0x34)
+    test.case("lengths are held to 0 through 8")
+    test.assert_eq(coapwire.token(5, -3).len, 0)
+    test.assert_eq(coapwire.token(5, 0).value, 0)
+    test.assert_eq(coapwire.token(5, 99).len, 8)
+    test.assert_eq(coapwire.token(5, 99).value, 5)
+    test.case("bytes, first highest, and outside the token")
+    let w = coapwire.token(0x0102030405060708, 8)
+    test.assert_eq(coapwire.token_byte(w, 0), 1)
+    test.assert_eq(coapwire.token_byte(w, 7), 8)
+    test.assert_eq(coapwire.token_byte(w, 8), 0)
+    test.assert_eq(coapwire.token_byte(w, -1), 0)
+    let top = coapwire.token(-1, 8)
+    test.assert_eq(coapwire.token_byte(top, 0), 0xFF)
+    test.case("equality is length and bytes")
+    test.assert(coapwire.token_eq(coapwire.token(7, 2), coapwire.token(7, 2)))
+    test.assert(not coapwire.token_eq(coapwire.token(7, 2), coapwire.token(7, 3)))
+    test.assert(not coapwire.token_eq(coapwire.token(7, 2), coapwire.token(8, 2)))
+    test.case("a message carries a token of 8 bytes and parses it back")
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.assert(get(var m, var b, w))
+    test.assert_eq(m.len(), 12)
+    test.assert_eq(m[0] as Int, 0x48)
+    let h = coapwire.parse(var m)
+    test.assert(coapwire.token_eq(h.token, w))
+    test.assert(get(var m, var b, top))
+    test.assert(coapwire.token_eq(coapwire.parse(var m).token, top))
+
+@test
+fn test_the_codes() [io]
+    test.assert_eq(coapwire.code_class(0x45), 2)
+    test.assert_eq(coapwire.code_detail(0x45), 5)
+    test.assert_eq(coapwire.make_code(2, 5), 0x45)
+    test.assert_eq(coapwire.make_code(4, 4), coapwire.COAP_NOT_FOUND)
+    test.assert_eq(coapwire.make_code(5, 0), coapwire.COAP_INTERNAL_SERVER_ERROR)
+    test.assert(coapwire.is_request(coapwire.COAP_GET))
+    test.assert(coapwire.is_request(coapwire.COAP_DELETE))
+    test.assert(not coapwire.is_request(coapwire.COAP_CODE_EMPTY))
+    test.assert(not coapwire.is_request(coapwire.COAP_CONTENT))
+    test.assert(coapwire.is_response(coapwire.COAP_CONTENT))
+    test.assert(coapwire.is_response(coapwire.COAP_NOT_FOUND))
+    test.assert(coapwire.is_response(coapwire.COAP_INTERNAL_SERVER_ERROR))
+    test.assert(not coapwire.is_response(coapwire.COAP_GET))
+    test.assert(not coapwire.is_response(0x20))
+    test.assert(coapwire.option_is_critical(11))
+    test.assert(not coapwire.option_is_critical(12))
+    test.case("the numbers are the RFC's")
+    test.assert_eq(coapwire.COAP_POST, 2)
+    test.assert_eq(coapwire.COAP_PUT, 3)
+    test.assert_eq(coapwire.COAP_CREATED, 0x41)
+    test.assert_eq(coapwire.COAP_DELETED, 0x42)
+    test.assert_eq(coapwire.COAP_VALID, 0x43)
+    test.assert_eq(coapwire.COAP_CHANGED, 0x44)
+    test.assert_eq(coapwire.COAP_CONTINUE, 0x5F)
+    test.assert_eq(coapwire.COAP_BAD_REQUEST, 0x80)
+    test.assert_eq(coapwire.COAP_UNAUTHORIZED, 0x81)
+    test.assert_eq(coapwire.COAP_BAD_OPTION, 0x82)
+    test.assert_eq(coapwire.COAP_FORBIDDEN, 0x83)
+    test.assert_eq(coapwire.COAP_METHOD_NOT_ALLOWED, 0x85)
+    test.assert_eq(coapwire.COAP_NOT_ACCEPTABLE, 0x86)
+    test.assert_eq(coapwire.COAP_REQUEST_ENTITY_INCOMPLETE, 0x88)
+    test.assert_eq(coapwire.COAP_PRECONDITION_FAILED, 0x8C)
+    test.assert_eq(coapwire.COAP_REQUEST_ENTITY_TOO_LARGE, 0x8D)
+    test.assert_eq(coapwire.COAP_UNSUPPORTED_CONTENT_FORMAT, 0x8F)
+    test.assert_eq(coapwire.COAP_NOT_IMPLEMENTED, 0xA1)
+    test.assert_eq(coapwire.COAP_BAD_GATEWAY, 0xA2)
+    test.assert_eq(coapwire.COAP_SERVICE_UNAVAILABLE, 0xA3)
+    test.assert_eq(coapwire.COAP_GATEWAY_TIMEOUT, 0xA4)
+    test.assert_eq(coapwire.COAP_PROXYING_NOT_SUPPORTED, 0xA5)
+    test.assert_eq(coapwire.COAP_OPT_IF_MATCH, 1)
+    test.assert_eq(coapwire.COAP_OPT_URI_HOST, 3)
+    test.assert_eq(coapwire.COAP_OPT_OBSERVE, 6)
+    test.assert_eq(coapwire.COAP_OPT_URI_PORT, 7)
+    test.assert_eq(coapwire.COAP_OPT_LOCATION_PATH, 8)
+    test.assert_eq(coapwire.COAP_OPT_LOCATION_QUERY, 20)
+    test.assert_eq(coapwire.COAP_OPT_BLOCK2, 23)
+    test.assert_eq(coapwire.COAP_OPT_BLOCK1, 27)
+    test.assert_eq(coapwire.COAP_OPT_SIZE2, 28)
+    test.assert_eq(coapwire.COAP_OPT_PROXY_URI, 35)
+    test.assert_eq(coapwire.COAP_OPT_PROXY_SCHEME, 39)
+    test.assert_eq(coapwire.COAP_OPT_ACCEPT, 17)
+
+@test
+fn test_a_message_that_is_not_one_is_a_fault() [io]
+    test.case("shorter than the header")
+    var a = msg_of([0x40, 0x01, 0x00])
+    test.assert_eq(coapwire.parse(var a).status, coapwire.COAP_PARSE_TOO_SHORT)
+    test.assert(not coapwire.header_ok(coapwire.parse(var a)))
+    test.case("version 2")
+    var v = msg_of([0x80, 0x01, 0x00, 0x00])
+    test.assert_eq(coapwire.parse(var v).status, coapwire.COAP_PARSE_BAD_VERSION)
+    test.case("a token length of 9")
+    var t = msg_of([0x49, 0x01, 0x00, 0x00])
+    test.assert_eq(coapwire.parse(var t).status, coapwire.COAP_PARSE_BAD_TOKEN_LENGTH)
+    test.case("a token that is cut short")
+    var c = msg_of([0x44, 0x01, 0x00, 0x00, 0x01, 0x02])
+    test.assert_eq(coapwire.parse(var c).status, coapwire.COAP_PARSE_TOO_SHORT)
+    test.case("a delta nibble of 15 that is not the marker")
+    var d15 = msg_of([0x40, 0x01, 0x00, 0x00, 0xF1, 0x00])
+    test.assert_eq(coapwire.parse(var d15).status, coapwire.COAP_PARSE_BAD_OPTION)
+    test.case("a length nibble of 15")
+    var l15 = msg_of([0x40, 0x01, 0x00, 0x00, 0x1F])
+    test.assert_eq(coapwire.parse(var l15).status, coapwire.COAP_PARSE_BAD_OPTION)
+    test.case("a value that runs past the end")
+    var past = msg_of([0x40, 0x01, 0x00, 0x00, 0xB5, 0x61])
+    test.assert_eq(coapwire.parse(var past).status, coapwire.COAP_PARSE_BAD_OPTION)
+    test.case("an extended delta or length that is cut short")
+    var e1 = msg_of([0x40, 0x01, 0x00, 0x00, 0xD1])
+    test.assert_eq(coapwire.parse(var e1).status, coapwire.COAP_PARSE_BAD_OPTION)
+    var e2 = msg_of([0x40, 0x01, 0x00, 0x00, 0xE1, 0x00])
+    test.assert_eq(coapwire.parse(var e2).status, coapwire.COAP_PARSE_BAD_OPTION)
+    var e3 = msg_of([0x40, 0x01, 0x00, 0x00, 0x1D])
+    test.assert_eq(coapwire.parse(var e3).status, coapwire.COAP_PARSE_BAD_OPTION)
+    test.case("a payload marker with nothing after it")
+    var mk = msg_of([0x40, 0x01, 0x00, 0x00, 0xFF])
+    test.assert_eq(coapwire.parse(var mk).status, coapwire.COAP_PARSE_EMPTY_PAYLOAD)
+    test.case("an Empty message longer than four bytes, or with a token")
+    var e4 = msg_of([0x40, 0x00, 0x00, 0x00, 0x00])
+    test.assert_eq(coapwire.parse(var e4).status, coapwire.COAP_PARSE_BAD_EMPTY)
+    var e5 = msg_of([0x41, 0x00, 0x00, 0x00, 0x55])
+    test.assert_eq(coapwire.parse(var e5).status, coapwire.COAP_PARSE_BAD_EMPTY)
+    test.case("an Empty message of four bytes is a message")
+    var ok = msg_of([0x70, 0x00, 0x12, 0x34])
+    let h = coapwire.parse(var ok)
+    test.assert(coapwire.header_ok(h))
+    test.assert_eq(h.kind, coapwire.COAP_TYPE_RST)
+    test.assert_eq(h.mid, 0x1234)
+
+@test
+fn test_the_builder_refuses_what_cannot_be_sent() [io]
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.case("a type out of range, and a token that is too long")
+    test.assert(not coapwire.begin(var m, var b, 4, coapwire.COAP_GET, 1, coapwire.token(0, 0)))
+    test.assert(not b.ok)
+    test.assert_eq(m.len(), 0)
+    test.assert(not coapwire.begin(var m, var b, 0, coapwire.COAP_GET, 1,
+                                   coapwire.CoapToken { len: 9, value: 0 }))
+    test.assert(not coapwire.begin(var m, var b, -1, coapwire.COAP_GET, 1, coapwire.token(0, 0)))
+    test.assert(not coapwire.begin(var m, var b, 0, coapwire.COAP_GET, 1,
+                                   coapwire.CoapToken { len: -1, value: 0 }))
+
+    test.case("an option out of order empties the message")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_uint(var m, var b, 12, 1))
+    test.assert(not coapwire.add_uint(var m, var b, 11, 1))
+    test.assert_eq(m.len(), 0)
+    test.assert(not b.ok)
+    test.case("and so do the options after a failure")
+    test.assert(not coapwire.add_str(var m, var b, 20, "a"))
+    test.assert(not coapwire.add_empty(var m, var b, 20))
+    test.assert(not coapwire.add_opaque(var m, var b, 20, 1, 1))
+    test.assert(not coapwire.add_path(var m, var b, "a"))
+    test.assert(not coapwire.add_query(var m, var b, "a"))
+    test.assert(not coapwire.start_payload(var m, var b))
+    test.assert(not coapwire.push_payload(var m, var b, 1))
+    test.assert(not coapwire.push_payload_str(var m, var b, "a"))
+    test.assert_eq(m.len(), 0)
+
+    test.case("an option after the payload marker is refused")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.start_payload(var m, var b))
+    test.assert(not coapwire.add_uint(var m, var b, 12, 1))
+
+    test.case("an option number over 65535 is refused")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(not coapwire.add_empty(var m, var b, 65536))
+
+@test
+fn test_a_full_message_refuses_the_next_piece() [io]
+    var b = coapwire.builder()
+    test.case("an option head that does not fit")
+    var m = filled(1152)
+    test.assert(not coapwire.add_uint(var m, var b, 12, 1))
+    test.assert_eq(m.len(), 0)
+    b = coapwire.builder()
+    m = filled(1152)
+    test.assert(not coapwire.add_empty(var m, var b, 12))
+    b = coapwire.builder()
+    m = filled(1151)
+    test.assert(not coapwire.add_str(var m, var b, 12, "ab"))
+    test.assert_eq(m.len(), 0)
+    b = coapwire.builder()
+    m = filled(1151)
+    test.assert(not coapwire.add_opaque(var m, var b, 12, 0x0102, 2))
+    b = coapwire.builder()
+    m = filled(1151)
+    test.assert(not coapwire.add_uint(var m, var b, 12, 0x0102))
+    test.case("a path segment that does not fit")
+    b = coapwire.builder()
+    m = filled(1151)
+    test.assert(not coapwire.add_path(var m, var b, "abc"))
+    test.assert_eq(m.len(), 0)
+    b = coapwire.builder()
+    m = filled(1151)
+    test.assert(not coapwire.add_query(var m, var b, "abc"))
+    test.case("the payload marker, a byte of payload and a string of it")
+    b = coapwire.builder()
+    m = filled(1152)
+    test.assert(not coapwire.start_payload(var m, var b))
+    test.assert_eq(m.len(), 0)
+    b = coapwire.builder()
+    m = filled(1152)
+    test.assert(not coapwire.push_payload(var m, var b, 1))
+    b = coapwire.builder()
+    m = filled(1151)
+    test.assert(not coapwire.push_payload_str(var m, var b, "ab"))
+    test.assert_eq(m.len(), 0)
+
+@test
+fn test_paths_and_queries() [io]
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.case("the root has no segments")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_path(var m, var b, "/"))
+    test.assert_eq(m.len(), 4)
+    test.assert(coapwire.add_path(var m, var b, ""))
+    test.assert_eq(m.len(), 4)
+    let root = coapwire.parse(var m)
+    test.assert(coapwire.path_is(var m, root, "/"))
+    test.assert(coapwire.path_is(var m, root, ""))
+    test.assert(not coapwire.path_is(var m, root, "a"))
+
+    test.case("segments, with and without the leading slash")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_path(var m, var b, "a/bc/d"))
+    let h = coapwire.parse(var m)
+    test.assert_eq(coapwire.count_options(var m, h, coapwire.COAP_OPT_URI_PATH), 3)
+    test.assert(coapwire.path_is(var m, h, "a/bc/d"))
+    test.assert(coapwire.path_is(var m, h, "/a/bc/d"))
+    test.assert(not coapwire.path_is(var m, h, "a/bc"))
+    test.assert(not coapwire.path_is(var m, h, "a/bc/d/e"))
+    test.assert(not coapwire.path_is(var m, h, "a/bx/d"))
+    test.assert(not coapwire.path_is(var m, h, "a/b/d"))
+    test.assert(not coapwire.path_is(var m, h, "a"))
+    test.assert(not coapwire.path_is(var m, h, ""))
+
+    test.case("a trailing slash is a different path")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_path(var m, var b, "a/"))
+    let t = coapwire.parse(var m)
+    test.assert_eq(coapwire.count_options(var m, t, coapwire.COAP_OPT_URI_PATH), 2)
+    test.assert(coapwire.path_is(var m, t, "a/"))
+    test.assert(not coapwire.path_is(var m, t, "a"))
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_path(var m, var b, "a"))
+    test.assert(not coapwire.path_is(var m, coapwire.parse(var m), "a/"))
+
+    test.case("an empty segment in the middle")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_path(var m, var b, "a//b"))
+    test.assert_eq(coapwire.count_options(var m, coapwire.parse(var m), 11), 3)
+    test.assert(coapwire.path_is(var m, coapwire.parse(var m), "a//b"))
+
+    test.case("queries are items between ampersands")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_query(var m, var b, ""))
+    test.assert_eq(m.len(), 4)
+    test.assert(coapwire.add_query(var m, var b, "a=1&bb=22&c"))
+    let q = coapwire.parse(var m)
+    test.assert_eq(coapwire.count_options(var m, q, coapwire.COAP_OPT_URI_QUERY), 3)
+    test.assert(coapwire.query_has(var m, q, "a=1"))
+    test.assert(coapwire.query_has(var m, q, "bb=22"))
+    test.assert(coapwire.query_has(var m, q, "c"))
+    test.assert(not coapwire.query_has(var m, q, "bb"))
+    test.assert(not coapwire.query_has(var m, q, "a=1&bb=22"))
+
+@test
+fn test_critical_options_the_server_does_not_understand() [io]
+    var m: coapwire.CoapMsg = Vec.new()
+    var b = coapwire.builder()
+    test.case("none, and only understood ones")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert_eq(coapwire.unknown_critical(var m, coapwire.parse(var m)), -1)
+    test.assert(coapwire.add_empty(var m, var b, coapwire.COAP_OPT_IF_MATCH))
+    test.assert(coapwire.add_str(var m, var b, coapwire.COAP_OPT_URI_HOST, "h"))
+    test.assert(coapwire.add_empty(var m, var b, coapwire.COAP_OPT_IF_NONE_MATCH))
+    test.assert(coapwire.add_empty(var m, var b, coapwire.COAP_OPT_OBSERVE))
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_URI_PORT, 5683))
+    test.assert(coapwire.add_path(var m, var b, "a"))
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_CONTENT_FORMAT, 0))
+    test.assert(coapwire.add_query(var m, var b, "a"))
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_ACCEPT, 0))
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_BLOCK2, 0))
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_BLOCK1, 0))
+    test.assert(coapwire.add_uint(var m, var b, coapwire.COAP_OPT_SIZE1, 0))
+    test.assert_eq(coapwire.unknown_critical(var m, coapwire.parse(var m)), -1)
+    test.case("a Proxy-Uri is critical and not understood")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_str(var m, var b, coapwire.COAP_OPT_PROXY_URI, "coap://x"))
+    test.assert_eq(coapwire.unknown_critical(var m, coapwire.parse(var m)), 35)
+    test.case("a critical option nobody defined")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_empty(var m, var b, 9))
+    test.assert_eq(coapwire.unknown_critical(var m, coapwire.parse(var m)), 9)
+    test.case("an elective option nobody defined is ignored")
+    test.assert(get(var m, var b, coapwire.token(0, 0)))
+    test.assert(coapwire.add_empty(var m, var b, 10))
+    test.assert_eq(coapwire.unknown_critical(var m, coapwire.parse(var m)), -1)

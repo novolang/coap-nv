@@ -1,0 +1,288 @@
+// coapserver.nv — a CoAP server's request path, with no allocation.
+//
+// `@tier(embedded)` on all of it, and generic over the caller's resources:
+// the effects of `serve` are the effects of the handler behind it, as
+// `[e]` says (SPEC section 5.6), so a handler that reads a sensor on a
+// device makes `serve` a `[hw]` function, and a handler in a test makes it
+// pure.
+//
+// A SERVER IS A TABLE AND A FUNCTION.  The table is `CoapResources`, a
+// trait the caller implements: how many resources there are, the path and
+// the allowed methods of each, and a handler that is called with the
+// request and fills in the response.  `serve` takes one datagram and
+// builds the datagram to send back; everything between is the message layer
+// of RFC 7252.
+//
+//   - A message that cannot be parsed is dropped, or reset if it was
+//     confirmable and the version is right.
+//   - A ping, a confirmable Empty message, is answered with a reset.
+//   - An ACK or a reset is not a request and is dropped.
+//   - A repeated message ID, one `CoapDedup` has seen, is not run again.
+//   - A critical option the server does not understand is answered with
+//     4.02 when the request is confirmable and dropped when it is not.
+//   - A path nothing has is answered with 4.04, a method the resource does
+//     not allow with 4.05.
+//   - Otherwise the handler runs.  The response is begun as the type the
+//     request calls for, an ACK carrying the request's message ID and token
+//     for a confirmable request and a non-confirmable message with a
+//     message ID of the caller's for a non-confirmable one, and the handler
+//     adds options and a payload and returns the code.
+//
+// A SEPARATE RESPONSE.  A handler that cannot answer at once returns
+// `COAP_DEFER`.  `serve` then builds an empty acknowledgement, and the
+// caller sends the response later with `coapmsg.build_separate`, using the
+// header it kept. A non-confirmable request needs no acknowledgement, and
+// nothing is sent.
+//
+// A HANDLER THAT FAILS.  If the handler leaves the builder failed, or returns
+// something that is not a response code, the answer is 5.00.
+//
+// WHAT IS NOT HERE.  The resource discovery of RFC 6690 (`/.well-known/core`)
+// is not served; a handler for that path is the caller's. Proxying is not
+// supported, and a request with a Proxy-Uri is refused by the critical-option
+// rule.
+
+use coapmsg
+use coapwire
+
+// The method bit of GET, in a resource's method mask: 1.
+pub const COAP_M_GET = 1
+// The method bit of POST: 2.
+pub const COAP_M_POST = 2
+// The method bit of PUT: 4.
+pub const COAP_M_PUT = 4
+// The method bit of DELETE: 8.
+pub const COAP_M_DELETE = 8
+
+// What a handler returns when it will answer later: -1.
+pub const COAP_DEFER = -1
+
+// `serve`: there is nothing to send.
+pub const COAP_SERVE_NONE = 0
+// `serve`: the response buffer holds the datagram to send.
+pub const COAP_SERVE_REPLY = 1
+// `serve`: the request is a repeat of one already answered. Send the
+// response that was sent the first time; the buffer is empty.
+pub const COAP_SERVE_DUPLICATE = 2
+
+// The resources of a server, as the caller holds them.
+//
+// A resource is numbered from 0 to `res_count() - 1`.
+pub trait CoapResources[e]
+    // How many resources there are.
+    fn res_count(self) -> Int [e]
+    // The path of resource `i`, such as `"sensors/temp"`.
+    fn res_path(self, i: Int) -> Str [e]
+    // The methods resource `i` allows, as the sum of `COAP_M_` bits.
+    fn res_methods(self, i: Int) -> Int [e]
+    // Handle a request for resource `i`.
+    //
+    // `method` is the request's code. The response in `resp` has been begun
+    // with its type, message ID and token; `b` is the builder for it.
+    // Add options in the order of their numbers, then the payload, and
+    // answer the response code, or `COAP_DEFER`.
+    fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader, var resp: CoapMsg, var b: CoapBuilder) -> Int [e]
+
+// The bit of a method code in a method mask: `COAP_M_GET` for GET and so
+// on, and 0 for a code that is not one of the four.
+pub @tier(embedded)
+@no_alloc
+fn method_bit(code: Int) -> Int []
+    if code == COAP_GET
+        return COAP_M_GET
+    if code == COAP_POST
+        return COAP_M_POST
+    if code == COAP_PUT
+        return COAP_M_PUT
+    if code == COAP_DELETE
+        return COAP_M_DELETE
+    0
+
+// The resource whose path the request names, or -1.
+//
+// ```novo
+// use coapserver
+// use coapwire
+//
+// struct One
+//     unused: Int
+//
+// impl CoapResources[] for One
+//     fn res_count(self) -> Int
+//         1
+//     fn res_path(self, i: Int) -> Str
+//         "sensors/temp"
+//     fn res_methods(self, i: Int) -> Int
+//         1
+//     fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader,
+//                   var resp: CoapMsg, var b: CoapBuilder) -> Int
+//         CONTENT
+//
+// fn main() [io]
+//     var m: coapwire.CoapMsg = Vec.new()
+//     var b = coapwire.builder()
+//     let _ = coapwire.begin(var m, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 1, coapwire.token(0, 0))
+//     let _ = coapwire.add_path(var m, var b, "sensors/temp")
+//     println("${coapserver.find_resource(One { unused: 0 }, var m, coapwire.parse(var m))}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn find_resource<R: CoapResources[e]>(r: R, var req: CoapMsg, h: CoapHeader) -> Int [e]
+    let n = r.res_count()
+    for i in 0..n
+        if coapwire.path_is(var req, h, r.res_path(i))
+            return i
+    -1
+
+// Begin an error response of the type the request calls for, with no
+// options or payload, and answer the datagram status.
+@tier(embedded)
+@no_alloc
+fn error_reply(var resp: CoapMsg, h: CoapHeader, code: Int, mid: Int) -> Int []
+    var b = coapwire.builder()
+    // A header and a token of a message that parsed always fit the buffer
+    // that was just emptied, so neither builder can refuse.
+    if h.kind == COAP_TYPE_CON
+        let _ = coapmsg.build_piggyback(var resp, var b, h, code)
+    else
+        let _ = coapmsg.build_non_response(var resp, var b, h, code, mid)
+    COAP_SERVE_REPLY
+
+// Whether a code is one a response may carry: class 2, 4 or 5.
+@tier(embedded)
+@no_alloc
+fn valid_response_code(code: Int) -> Bool []
+    code >= 0 and code <= 255 and coapwire.is_response(code)
+
+// The reset a message that cannot be parsed deserves: none unless it was
+// confirmable, and none for a version that is not 1 or a message too short
+// to hold an ID.
+@tier(embedded)
+@no_alloc
+fn reject_unparsed(var req: CoapMsg, var resp: CoapMsg) -> Int []
+    if req.len() < 4
+        return COAP_SERVE_NONE
+    let b0 = req[0] as Int
+    if (b0 >> 6) != COAP_VERSION or ((b0 >> 4) & 3) != COAP_TYPE_CON
+        return COAP_SERVE_NONE
+    // Four bytes always fit the emptied buffer.
+    let _ = coapmsg.build_reset(var resp, (req[2] as Int << 8) | req[3] as Int)
+    COAP_SERVE_REPLY
+
+// Take one request datagram and build the datagram to answer it.
+//
+// `req` is the datagram that arrived, `resp` receives the answer, `d` is
+// the memory of message IDs for this peer, and `mid` is a message ID for
+// any message of the server's own (the response to a non-confirmable
+// request); the caller steps it with `coapmsg.next_mid`. Answers
+// `COAP_SERVE_REPLY` when `resp` holds a datagram to send,
+// `COAP_SERVE_DUPLICATE` for a repeated request, and `COAP_SERVE_NONE` when
+// nothing is to be sent.
+//
+// ```novo
+// use coapserver
+// use coapwire
+// use coapmsg
+//
+// struct Temp
+//     unused: Int
+//
+// impl CoapResources[] for Temp
+//     fn res_count(self) -> Int
+//         1
+//     fn res_path(self, i: Int) -> Str
+//         "temp"
+//     fn res_methods(self, i: Int) -> Int
+//         1
+//     fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader,
+//                   var resp: CoapMsg, var b: CoapBuilder) -> Int
+//         let _ = coapwire.start_payload(var resp, var b)
+//         let _ = coapwire.push_payload_str(var resp, var b, "21.5")
+//         coapwire.COAP_CONTENT
+//
+// fn main() [io]
+//     var req: coapwire.CoapMsg = Vec.new()
+//     var b = coapwire.builder()
+//     let _ = coapwire.begin(var req, var b, coapwire.COAP_TYPE_CON, coapwire.COAP_GET, 0x1234, coapwire.token(0x71, 1))
+//     let _ = coapwire.add_path(var req, var b, "temp")
+//     var resp: coapwire.CoapMsg = Vec.new()
+//     var d = coapmsg.dedup()
+//     let r = coapserver.serve(Temp { unused: 0 }, var req, var resp, var d, 1)
+//     let h = coapwire.parse(var resp)
+//     println("${r} ${h.kind} ${h.code} ${h.mid} ${coapwire.payload_len(h)}")   // 1 2 69 4660 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn serve<R: CoapResources[e]>(r: R, var req: CoapMsg, var resp: CoapMsg, var d: CoapDedup,
+                              mid: Int) -> Int [e]
+    resp.clear()
+    let h = coapwire.parse(var req)
+    if h.status != COAP_PARSE_OK
+        return reject_unparsed(var req, var resp)
+    if h.kind == COAP_TYPE_ACK or h.kind == COAP_TYPE_RST
+        return COAP_SERVE_NONE
+    if coapmsg.is_ping(h)
+        let _ = coapmsg.build_reset(var resp, h.mid)
+        return COAP_SERVE_REPLY
+    if not coapwire.is_request(h.code)
+        if h.kind == COAP_TYPE_CON
+            let _ = coapmsg.build_reset(var resp, h.mid)
+            return COAP_SERVE_REPLY
+        return COAP_SERVE_NONE
+    if coapmsg.dedup_seen(var d, h.mid)
+        return COAP_SERVE_DUPLICATE
+    if coapwire.unknown_critical(var req, h) >= 0
+        if h.kind == COAP_TYPE_CON
+            return error_reply(var resp, h, COAP_BAD_OPTION, mid)
+        return COAP_SERVE_NONE
+    let i = find_resource(r, var req, h)
+    if i < 0
+        return error_reply(var resp, h, COAP_NOT_FOUND, mid)
+    if (r.res_methods(i) & method_bit(h.code)) == 0
+        return error_reply(var resp, h, COAP_METHOD_NOT_ALLOWED, mid)
+    var b = coapwire.builder()
+    if h.kind == COAP_TYPE_CON
+        let _ = coapmsg.build_piggyback(var resp, var b, h, COAP_CONTENT)
+    else
+        let _ = coapmsg.build_non_response(var resp, var b, h, COAP_CONTENT, mid)
+    let code = r.res_handle(i, h.code, var req, h, var resp, var b)
+    if code == COAP_DEFER
+        resp.clear()
+        if h.kind == COAP_TYPE_CON
+            let _ = coapmsg.build_empty_ack(var resp, h.mid)
+            return COAP_SERVE_REPLY
+        return COAP_SERVE_NONE
+    if not b.ok or not valid_response_code(code)
+        return error_reply(var resp, h, COAP_INTERNAL_SERVER_ERROR, mid)
+    resp[1] = code as u8
+    COAP_SERVE_REPLY
+
+// A table with no resources.
+//
+// A server over it answers every request with 4.04, every ping with a reset
+// and every message it cannot read as `serve` says. It is the smallest
+// `CoapResources`, and it is the implementation the compiler reads to
+// check that `serve` allocates nothing, since a trait call is checked
+// against a body it can see.
+pub @value
+struct CoapNoResources
+    // Unused; a `@value` needs a field.
+    unused: Int
+
+impl CoapResources[] for CoapNoResources
+    @tier(embedded)
+    fn res_count(self) -> Int []
+        0
+
+    @tier(embedded)
+    fn res_path(self, i: Int) -> Str []
+        ""
+
+    @tier(embedded)
+    fn res_methods(self, i: Int) -> Int []
+        0
+
+    @tier(embedded)
+    fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader, var resp: CoapMsg,
+                  var b: CoapBuilder) -> Int []
+        COAP_NOT_IMPLEMENTED
