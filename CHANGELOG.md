@@ -5,7 +5,7 @@ All notable changes to coap-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## 0.1.1
+## 0.2.0
 
 ### Changed
 
