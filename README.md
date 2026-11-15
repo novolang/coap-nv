@@ -34,7 +34,9 @@ the path of each, the methods each allows, and a handler that fills in the
 response. `serve` takes one datagram and builds the answer, with the
 message layer of RFC 7252 around the handler. The effects of `serve` are
 the effects of the handler: a handler that reads a sensor makes it a `[hw]`
-function, and a handler in a test makes it pure.
+function, and a handler in a test makes it pure. The four functions are
+`@no_alloc` in the trait, so each method of an impl is marked `@no_alloc` too,
+and the compiler checks its body where the impl is written.
 
 ## Install
 
@@ -58,15 +60,19 @@ struct Temp
     unused: Int
 
 impl CoapResources[] for Temp
+    @no_alloc
     fn res_count(self) -> Int
         1
 
+    @no_alloc
     fn res_path(self, i: Int) -> Str
         "temperature"
 
+    @no_alloc
     fn res_methods(self, i: Int) -> Int
         coapserver.COAP_M_GET
 
+    @no_alloc
     fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader,
                   var resp: CoapMsg, var b: CoapBuilder) -> Int
         let _ = coapwire.start_payload(var resp, var b)

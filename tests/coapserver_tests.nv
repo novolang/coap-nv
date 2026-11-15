@@ -16,13 +16,37 @@ use coapobs
 use coapserver
 use coapwire
 
+// A table with no resources: every request is 4.04.
+struct Empty
+    unused: Int
+
+impl CoapResources[] for Empty
+    @no_alloc
+    fn res_count(self) -> Int
+        0
+
+    @no_alloc
+    fn res_path(self, i: Int) -> Str
+        ""
+
+    @no_alloc
+    fn res_methods(self, i: Int) -> Int
+        0
+
+    @no_alloc
+    fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader, var resp: CoapMsg,
+                  var b: CoapBuilder) -> Int
+        coapwire.COAP_NOT_IMPLEMENTED
+
 struct Table
     unused: Int
 
 impl CoapResources[] for Table
+    @no_alloc
     fn res_count(self) -> Int
         6
 
+    @no_alloc
     fn res_path(self, i: Int) -> Str
         match i
             0 => "sensors/temp"
@@ -32,12 +56,14 @@ impl CoapResources[] for Table
             4 => "failing"
             _ => "echo"
 
+    @no_alloc
     fn res_methods(self, i: Int) -> Int
         match i
             1 => 5
             5 => 15
             _ => 1
 
+    @no_alloc
     fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader, var resp: CoapMsg,
                   var b: CoapBuilder) -> Int
         if i == 0
@@ -304,7 +330,7 @@ fn test_a_critical_option_the_server_does_not_know() [io]
 
 @test
 fn test_the_empty_table() [io]
-    let t = coapserver.CoapNoResources { unused: 0 }
+    let t = Empty { unused: 0 }
     test.assert_eq(t.res_count(), 0)
     test.assert_eq(t.res_path(0), "")
     test.assert_eq(t.res_methods(0), 0)

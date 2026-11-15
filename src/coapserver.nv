@@ -68,12 +68,20 @@ pub const COAP_SERVE_DUPLICATE = 2
 // The resources of a server, as the caller holds them.
 //
 // A resource is numbered from 0 to `res_count() - 1`.
+//
+// Every member is `@no_alloc`, which is the promise the trait makes for
+// every impl: `serve` and `find_resource` are `@no_alloc` and call all four,
+// so an impl marks each of its methods `@no_alloc` too, and the compiler
+// checks the body of each where the impl is written.
 pub trait CoapResources[e]
     // How many resources there are.
+    @no_alloc
     fn res_count(self) -> Int [e]
     // The path of resource `i`, such as `"sensors/temp"`.
+    @no_alloc
     fn res_path(self, i: Int) -> Str [e]
     // The methods resource `i` allows, as the sum of `COAP_M_` bits.
+    @no_alloc
     fn res_methods(self, i: Int) -> Int [e]
     // Handle a request for resource `i`.
     //
@@ -81,6 +89,7 @@ pub trait CoapResources[e]
     // with its type, message ID and token; `b` is the builder for it.
     // Add options in the order of their numbers, then the payload, and
     // answer the response code, or `COAP_DEFER`.
+    @no_alloc
     fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader, var resp: CoapMsg, var b: CoapBuilder) -> Int [e]
 
 // The bit of a method code in a method mask: `COAP_M_GET` for GET and so
@@ -108,12 +117,16 @@ fn method_bit(code: Int) -> Int []
 //     unused: Int
 //
 // impl CoapResources[] for One
+//     @no_alloc
 //     fn res_count(self) -> Int
 //         1
+//     @no_alloc
 //     fn res_path(self, i: Int) -> Str
 //         "sensors/temp"
+//     @no_alloc
 //     fn res_methods(self, i: Int) -> Int
 //         1
+//     @no_alloc
 //     fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader,
 //                   var resp: CoapMsg, var b: CoapBuilder) -> Int
 //         coapwire.COAP_CONTENT
@@ -188,12 +201,16 @@ fn reject_unparsed(var req: CoapMsg, var resp: CoapMsg) -> Int []
 //     unused: Int
 //
 // impl CoapResources[] for Temp
+//     @no_alloc
 //     fn res_count(self) -> Int
 //         1
+//     @no_alloc
 //     fn res_path(self, i: Int) -> Str
 //         "temp"
+//     @no_alloc
 //     fn res_methods(self, i: Int) -> Int
 //         1
+//     @no_alloc
 //     fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader,
 //                   var resp: CoapMsg, var b: CoapBuilder) -> Int
 //         let _ = coapwire.start_payload(var resp, var b)
@@ -256,34 +273,3 @@ fn serve<R: CoapResources[e]>(r: R, var req: CoapMsg, var resp: CoapMsg, var d: 
         return error_reply(var resp, h, COAP_INTERNAL_SERVER_ERROR, mid)
     resp[1] = code as u8
     COAP_SERVE_REPLY
-
-// A table with no resources.
-//
-// A server over it answers every request with 4.04, every ping with a reset
-// and every message it cannot read as `serve` says. It is the smallest
-// `CoapResources`, and it is the implementation the compiler reads to
-// check that `serve` allocates nothing, since a trait call is checked
-// against a body it can see.
-pub @value
-struct CoapNoResources
-    // Unused; a `@value` needs a field.
-    unused: Int
-
-// workaround(no-alloc-through-a-trait-bound-is-refused-when-the-package-has-no-impl): a @no_alloc function generic over a trait bound builds only when the compilation unit holds an impl of the trait, so the package holds this one.
-impl CoapResources[] for CoapNoResources
-    @tier(embedded)
-    fn res_count(self) -> Int []
-        0
-
-    @tier(embedded)
-    fn res_path(self, i: Int) -> Str []
-        ""
-
-    @tier(embedded)
-    fn res_methods(self, i: Int) -> Int []
-        0
-
-    @tier(embedded)
-    fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader, var resp: CoapMsg,
-                  var b: CoapBuilder) -> Int []
-        COAP_NOT_IMPLEMENTED

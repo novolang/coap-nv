@@ -1,6 +1,6 @@
 [package]
 name        = "coap-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "CoAP over UDP for novo-lang, RFC 7252 with block-wise transfer (RFC 7959) and observe (RFC 7641): the message, its options and token, the message layer with confirmable retransmission as a step a caller drives, block and observer state, and a server that routes a request to the caller's resource handler. Over buffers the caller owns, with no allocation and no sockets."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -9,7 +9,7 @@ layer       = "core"
 tags        = ["coap", "rfc7252", "rfc7959", "rfc7641", "iot", "udp", "observe", "block-wise", "embedded", "sans-io", "no-alloc"]
 repository  = "https://github.com/novolang/coap-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.23.0"
+novo        = ">= 0.26.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

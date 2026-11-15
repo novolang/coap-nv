@@ -5,6 +5,28 @@ All notable changes to coap-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.1
+
+### Changed
+
+- The four members of `CoapResources` (`res_count`, `res_path`, `res_methods`
+  and `res_handle`) carry `@no_alloc` (SPEC section 12.6). It is the promise
+  the trait makes for every impl, and `serve` and `find_resource` call the
+  members through their bound on that promise, with no impl in the package for
+  the compiler to read. An impl marks each of its methods `@no_alloc` too,
+  and the compiler checks the body of each where the impl is written; an
+  impl method without the mark is `E4005`. The package asks for a toolchain
+  that accepts the mark on a trait member (`novo = ">= 0.26.0"`).
+
+### Removed
+
+- `CoapNoResources`. The package held it so that `serve` and `find_resource`
+  could carry `@no_alloc` while the compiler refused a call through a trait
+  bound when the compilation unit held no impl; the mark on the trait members
+  makes it unnecessary. A caller that used it as an empty table writes its own
+  four methods, marked `@no_alloc`, as `Empty` in `tests/coapserver_tests.nv`
+  does.
+
 ## 0.1.0
 
 The first release.

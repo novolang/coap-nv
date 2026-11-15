@@ -37,20 +37,24 @@ struct Sensor
 
 impl CoapResources[] for Sensor
     @tier(embedded)
+    @no_alloc
     fn res_count(self) -> Int []
         2
 
     @tier(embedded)
+    @no_alloc
     fn res_path(self, i: Int) -> Str []
         if i == 0
             return "temperature"
         "blob"
 
     @tier(embedded)
+    @no_alloc
     fn res_methods(self, i: Int) -> Int []
         coapserver.COAP_M_GET
 
     @tier(embedded)
+    @no_alloc
     fn res_handle(self, i: Int, method: Int, var req: CoapMsg, h: CoapHeader, var resp: CoapMsg,
                   var b: CoapBuilder) -> Int []
         if i == 0
